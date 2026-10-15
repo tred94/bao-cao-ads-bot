@@ -1,0 +1,37 @@
+name: He Thong Bao Cao Va Menu Ads 2 Trong 1
+
+on:
+  schedule:
+    # 1. Tự động gửi báo cáo tổng hợp lúc 8h00 sáng và 20h00 tối (Giờ VN)
+    - cron: '0 1 * * *'
+    - cron: '0 13 * * *'
+    # 2. Tự động kiểm tra xem bạn có gõ /menu trên Telegram không (mỗi 30 phút, chỉ mất 2 giây)
+    - cron: '*/30 * * * *'
+
+  # 3. Cho phép bấm nút chạy ngay lập tức bất cứ lúc nào
+  workflow_dispatch:
+
+jobs:
+  ads-assistant:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Tải code
+        uses: actions/checkout@v4
+
+      - name: Cài đặt Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Cài thư viện
+        run: pip install requests
+
+      - name: Chạy Trợ lý Ads (Tự động & Chủ động)
+        env:
+          FB_ACCESS_TOKEN: ${{ secrets.FB_ACCESS_TOKEN }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: "5657736528"
+          KPI_GIA_MESS: "60000"
+          LOAI_KICH_HOAT: ${{ (github.event_name == 'workflow_dispatch' || github.event.schedule == '0 1 * * *' || github.event.schedule == '0 13 * * *') && 'bao_cao_dinh_ky' || 'kiem_tra_nhanh' }}
+        run: python bot.py
