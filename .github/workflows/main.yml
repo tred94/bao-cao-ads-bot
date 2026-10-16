@@ -1,45 +1,45 @@
-name: He Thong Bao Cao Va Menu Ads 2 Trong 1
+name: Meta Ads Telegram (08h / 20h VN)
 
 on:
   schedule:
-    # 1. Đúng 8h00 sáng giờ VN (01:00 UTC) -> Báo cáo số liệu HÔM QUA
-    - cron: '0 1 * * *'
-    # 2. Đúng 20h00 tối giờ VN (13:00 UTC) -> Báo cáo số liệu HÔM NAY
-    - cron: '0 13 * * *'
-    # 3. Quét tin nhắn Telegram ở các phút lẻ (né phút thứ 0 ra để không bao giờ đè lên giờ báo cáo!)
-    - cron: '10,25,40,55 * * * *'
-
-  # 4. Khi bạn chủ động bấm Run workflow trên web/app GitHub
+    - cron: '0 1 * * *'    # 08:00 Asia/Ho_Chi_Minh (GitHub UTC)
+    - cron: '0 13 * * *'   # 20:00 Asia/Ho_Chi_Minh (GitHub UTC)
   workflow_dispatch:
     inputs:
       che_do:
-        description: 'Gõ: menu (chỉ mở Menu) | yesterday (Báo cáo Hôm qua) | today (Báo cáo Hôm nay)'
-        required: false
-        default: 'menu'
+        description: 'Chạy thử báo cáo hoặc mở menu'
+        type: choice
+        required: true
+        default: menu
+        options:
+          - menu
+          - yesterday
+          - today
+
+permissions:
+  contents: read
 
 jobs:
-  ads-assistant:
+  report:
     runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      FB_ACCESS_TOKEN: ${{ secrets.FB_ACCESS_TOKEN }}
+      GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+      KPI_GIA_MESS: '60000'
+      EVENT_NAME: ${{ github.event_name }}
+      CRON_SCHEDULE: ${{ github.event.schedule }}
+      CHE_DO_INPUT: ${{ inputs.che_do || 'menu' }}
     steps:
-      - name: Tải code
+      - name: Checkout
         uses: actions/checkout@v4
-
-      - name: Cài đặt Python
+      - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-
-      - name: Cài thư viện
-        run: pip install requests
-
-      - name: Chạy Trợ lý Ads
-        env:
-          FB_ACCESS_TOKEN: ${{ secrets.FB_ACCESS_TOKEN }}
-          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          KPI_GIA_MESS: "60000"
-          EVENT_NAME: ${{ github.event_name }}
-          CRON_SCHEDULE: ${{ github.event.schedule }}
-          CHE_DO_INPUT: ${{ github.event.inputs.che_do }}
-        run: python bot.py
+      - name: Install dependencies
+        run: python -m pip install requests
+      - name: Run Telegram Ads report
+        run: python bot_meta_ads_fix_bao_cao.py
