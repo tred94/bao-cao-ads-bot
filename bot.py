@@ -805,7 +805,7 @@ if __name__ == "__main__":
 
     # Tính giờ Việt Nam hiện tại (UTC + 7)
     gio_vn = datetime.now(timezone(timedelta(hours=7))).hour
-    ky_mac_dinh_theo_gio = "yesterday" if gio_vn < 14 else "today"
+    ky_mac_dinh_theo_gio = "today" if gio_vn < 14 else "today"
 
     res_check = requests.get(f"https://api.telegram.org/bot{TELE_TOKEN}/getUpdates?timeout=3").json()
     updates = res_check.get("result", [])
