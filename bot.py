@@ -12,7 +12,7 @@ TELE_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
 if TELE_TOKEN.startswith("bot"):
     TELE_TOKEN = TELE_TOKEN[3:]
 
-CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "5657736528").strip()
+CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
 KPI_MESS = int(os.environ.get("KPI_GIA_MESS", "60000"))
 THOI_GIAN_CHO_BAM_NUT = 600  # Thức 10 phút chờ bạn bấm nút
 
