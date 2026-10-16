@@ -120,7 +120,7 @@ def quet_danh_sach_tai_khoan():
     return ds_tk
 
 
-def tai_du_lieu_5_tang(ma_tk, khoang_tg="yesterday"):
+def tai_du_lieu_5_tang(ma_tk, khoang_tg="t"):
     url_camp = f"https://graph.facebook.com/v21.0/{ma_tk}/campaigns"
     r_camp = requests.get(
         url_camp,
@@ -393,7 +393,7 @@ def gui_hoac_sua_menu(chat_id, van_ban, nut_bam=None, msg_id=None):
             print("❌ Lỗi Telegram:", res)
 
 
-def hien_menu_chinh(cid, msg_id=None, tg_mac_dinh="yesterday"):
+def hien_menu_chinh(cid, msg_id=None, tg_mac_dinh="today"):
     global BO_NHO_BM
     if not BO_NHO_BM:
         BO_NHO_BM = quet_danh_sach_tai_khoan()
@@ -573,7 +573,7 @@ def hien_man_hinh_group(cid, tk_idx, c_idx, g_idx, msg_id=None):
 # ==============================================================================
 # 5. BÁO CÁO TỰ ĐỘNG (8H SÁNG -> HÔM QUA | 20H TỐI -> HÔM NAY)
 # ==============================================================================
-def chay_bao_cao_tu_dong(khoang_tg="yesterday"):
+def chay_bao_cao_tu_dong(khoang_tg="today"):
     global BO_NHO_BM
     BO_NHO_BM = quet_danh_sach_tai_khoan()
     ten_ky = "NGÀY HÔM QUA" if khoang_tg == "yesterday" else "NGÀY HÔM NAY"
