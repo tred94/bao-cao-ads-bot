@@ -2,14 +2,20 @@ name: He Thong Bao Cao Va Menu Ads 2 Trong 1
 
 on:
   schedule:
-    # 1. Tự động gửi báo cáo tổng hợp lúc 8h00 sáng và 20h00 tối (Giờ VN)
+    # 1. Đúng 8h00 sáng giờ VN (01:00 UTC) -> Báo cáo số liệu HÔM QUA
     - cron: '0 1 * * *'
+    # 2. Đúng 20h00 tối giờ VN (13:00 UTC) -> Báo cáo số liệu HÔM NAY
     - cron: '0 13 * * *'
-    # 2. Tự động kiểm tra xem bạn có gõ /menu trên Telegram không (mỗi 30 phút, chỉ mất 2 giây)
-    - cron: '*/30 * * * *'
+    # 3. Quét tin nhắn Telegram ở các phút lẻ (né phút thứ 0 ra để không bao giờ đè lên giờ báo cáo!)
+    - cron: '10,25,40,55 * * * *'
 
-  # 3. Cho phép bấm nút chạy ngay lập tức bất cứ lúc nào
+  # 4. Khi bạn chủ động bấm Run workflow trên web/app GitHub
   workflow_dispatch:
+    inputs:
+      che_do:
+        description: 'Gõ: menu (chỉ mở Menu) | yesterday (Báo cáo Hôm qua) | today (Báo cáo Hôm nay)'
+        required: false
+        default: 'menu'
 
 jobs:
   ads-assistant:
@@ -26,12 +32,14 @@ jobs:
       - name: Cài thư viện
         run: pip install requests
 
-      - name: Chạy Trợ lý Ads (Tự động & Chủ động)
+      - name: Chạy Trợ lý Ads
         env:
           FB_ACCESS_TOKEN: ${{ secrets.FB_ACCESS_TOKEN }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: "5657736528"
           KPI_GIA_MESS: "60000"
-          LOAI_KICH_HOAT: ${{ (github.event_name == 'workflow_dispatch' || github.event.schedule == '0 1 * * *' || github.event.schedule == '0 13 * * *') && 'bao_cao_dinh_ky' || 'kiem_tra_nhanh' }}
+          EVENT_NAME: ${{ github.event_name }}
+          CRON_SCHEDULE: ${{ github.event.schedule }}
+          CHE_DO_INPUT: ${{ github.event.inputs.che_do }}
         run: python bot.py
