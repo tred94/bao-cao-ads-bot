@@ -813,7 +813,7 @@ if __name__ == "__main__":
 
     # 1. Khi bạn bấm nút Run workflow trên GitHub
     if event_name == "workflow_dispatch":
-        if che_do_input in ["yesterday", "today"]:
+        if che_do_input in ["today", "yesterday"]:
             chay_bao_cao_tu_dong(che_do_input)
         hien_menu_chinh(CHAT_ID, tg_mac_dinh=ky_mac_dinh_theo_gio)
         lang_nghe_nut_bam_thong_minh(next_offset)
