@@ -2,38 +2,35 @@ name: He Thong Bao Cao Va Menu Ads 2 Trong 1
 
 on:
   schedule:
-    # Chạy nối tiếp mỗi 1 tiếng (ở phút 58) để Bot thức xuyên suốt 24/24
-    # Đảm bảo đúng 8h00 sáng và 20h00 tối máy chủ luôn đang thức sẵn để nổ báo cáo đúng từng giây!
     - cron: '58 * * * *'
-
+  # Cho phép nhận tín hiệu đánh thức từ bên ngoài (như cron-job.org)
+  repository_dispatch:
+    types: [thuc_day_bot]
   workflow_dispatch:
     inputs:
       che_do:
-        description: 'Gõ: menu (Mở Menu) | yesterday (Test báo cáo 8h sáng - Hôm qua) | today (Test báo cáo 20h tối - Hôm nay)'
+        description: 'Gõ: menu | yesterday | today'
         required: false
         default: 'menu'
 
-# Tự động hủy phiên cũ khi phiên mới bật lên để không bao giờ bị trùng 2 bot chạy song song
 concurrency:
   group: ads-bot-247
   cancel-in-progress: true
 
 jobs:
   ads-assistant:
+  # (Phần dưới giữ nguyên như cũ)
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
       - name: Tải code
         uses: actions/checkout@v4
-
       - name: Cài đặt Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-
       - name: Cài thư viện
         run: pip install requests
-
       - name: Chạy Trợ lý Ads 24/7
         env:
           FB_ACCESS_TOKEN: ${{ secrets.FB_ACCESS_TOKEN }}
