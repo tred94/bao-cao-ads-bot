@@ -1,45 +1,46 @@
-name: Meta Ads Telegram (08h / 20h VN)
+name: He Thong Bao Cao Va Menu Ads 2 Trong 1
 
 on:
   schedule:
-    - cron: '0 1 * * *'    # 08:00 Asia/Ho_Chi_Minh (GitHub UTC)
-    - cron: '0 13 * * *'   # 20:00 Asia/Ho_Chi_Minh (GitHub UTC)
+    # Chạy nối tiếp mỗi 1 tiếng (ở phút 58) để Bot thức xuyên suốt 24/24
+    # Đảm bảo đúng 8h00 sáng và 20h00 tối máy chủ luôn đang thức sẵn để nổ báo cáo đúng từng giây!
+    - cron: '58 * * * *'
+
   workflow_dispatch:
     inputs:
       che_do:
-        description: 'Chạy thử báo cáo hoặc mở menu'
-        type: choice
-        required: true
-        default: menu
-        options:
-          - menu
-          - yesterday
-          - today
+        description: 'Gõ: menu (Mở Menu) | yesterday (Test báo cáo 8h sáng - Hôm qua) | today (Test báo cáo 20h tối - Hôm nay)'
+        required: false
+        default: 'menu'
 
-permissions:
-  contents: read
+# Tự động hủy phiên cũ khi phiên mới bật lên để không bao giờ bị trùng 2 bot chạy song song
+concurrency:
+  group: ads-bot-247
+  cancel-in-progress: true
 
 jobs:
-  report:
+  ads-assistant:
     runs-on: ubuntu-latest
-    timeout-minutes: 25
-    env:
-      FB_ACCESS_TOKEN: ${{ secrets.FB_ACCESS_TOKEN }}
-      GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-      KPI_GIA_MESS: '60000'
-      EVENT_NAME: ${{ github.event_name }}
-      CRON_SCHEDULE: ${{ github.event.schedule }}
-      CHE_DO_INPUT: ${{ inputs.che_do || 'menu' }}
+    timeout-minutes: 60
     steps:
-      - name: Checkout
+      - name: Tải code
         uses: actions/checkout@v4
-      - name: Setup Python
+
+      - name: Cài đặt Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-      - name: Install dependencies
-        run: python -m pip install requests
-      - name: Run Telegram Ads report
-        run: python bot_meta_ads_fix_bao_cao.py
+
+      - name: Cài thư viện
+        run: pip install requests
+
+      - name: Chạy Trợ lý Ads 24/7
+        env:
+          FB_ACCESS_TOKEN: ${{ secrets.FB_ACCESS_TOKEN }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          KPI_GIA_MESS: "60000"
+          EVENT_NAME: ${{ github.event_name }}
+          CHE_DO_INPUT: ${{ github.event.inputs.che_do }}
+        run: python bot.py
