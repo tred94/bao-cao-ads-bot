@@ -1,43 +1,36 @@
-name: He Thong Bao Cao Va Menu Ads 2 Trong 1
+name: Chay Bot Ads 24/7
 
 on:
-  schedule:
-    - cron: '58 * * * *'
-  # Cho phép nhận tín hiệu đánh thức từ bên ngoài (như cron-job.org)
   repository_dispatch:
     types: [thuc_day_bot]
   workflow_dispatch:
-    inputs:
-      che_do:
-        description: 'Gõ: menu | yesterday | today'
-        required: false
-        default: 'menu'
 
 concurrency:
-  group: ads-bot-247
+  group: bot-running-group
   cancel-in-progress: true
 
 jobs:
-  ads-assistant:
-  # (Phần dưới giữ nguyên như cũ)
+  run-bot:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
     steps:
-      - name: Tải code
+      - name: Checkout mã nguồn
         uses: actions/checkout@v4
+
       - name: Cài đặt Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
-      - name: Cài thư viện
-        run: pip install requests
-      - name: Chạy Trợ lý Ads 24/7
+          python-version: '3.10'
+
+      - name: Cài đặt thư viện
+        run: |
+          pip install requests
+
+      - name: Khởi chạy Bot
         env:
           FB_ACCESS_TOKEN: ${{ secrets.FB_ACCESS_TOKEN }}
-          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           KPI_GIA_MESS: "60000"
-          EVENT_NAME: ${{ github.event_name }}
-          CHE_DO_INPUT: ${{ github.event.inputs.che_do }}
         run: python bot.py
