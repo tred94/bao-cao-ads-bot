@@ -7,13 +7,14 @@ from datetime import datetime, timezone, timedelta
 # ==============================================================================
 # 🛠️ KHU VỰC CẤU HÌNH DỄ CHỈNH SỬA
 # ==============================================================================
-KPI_MESS = int(os.environ.get("KPI_GIA_MESS") or "60000")     # Mốc KPI giá mỗi tin nhắn (VNĐ)
-GIO_BAO_CAO_SANG = 8                                          # 8h sáng -> Tự báo số liệu HÔM QUA (yesterday)
-GIO_BAO_CAO_TOI = 20                                          # 20h tối -> Tự báo số liệu HÔM NAY (today)
-THOI_GIAN_DUY_TRI_PHIEN = 54 * 60                             # Giữ Bot thức liên tục 54 phút (nối tiếp mỗi giờ = 24/24)
+KPI_MESS = int(os.environ.get("KPI_GIA_MESS") or "60000")      # Mốc KPI giá mỗi tin nhắn (VNĐ)
+GIO_BAO_CAO_SANG = 8                                           # 8h sáng -> Tự báo số liệu HÔM QUA (yesterday)
+GIO_BAO_CAO_TOI = 20                                           # 20h tối -> Tự báo số liệu HÔM NAY (today)
+THOI_GIAN_DUY_TRI_PHIEN = 54 * 60                              # Giữ Bot thức liên tục 54 phút (nối tiếp mỗi giờ = 24/24)
 
 FB_TOKEN = (os.environ.get("FB_ACCESS_TOKEN") or "").strip()
 GEMINI_KEY = (os.environ.get("GEMINI_API_KEY") or "").strip()
+OPENAI_KEY = (os.environ.get("OPENAI_API_KEY") or "").strip()
 TELE_TOKEN = (os.environ.get("TELEGRAM_BOT_TOKEN") or "").strip()
 if TELE_TOKEN.startswith("bot"):
     TELE_TOKEN = TELE_TOKEN[3:]
@@ -258,7 +259,7 @@ def tai_du_lieu_5_tang(ma_tk, khoang_tg="today"):
 
 
 # ==============================================================================
-# 3. KẺ BẢNG SỐ LIỆU & GEMINI BẮT BỆNH NGẮN GỌN TRỌNG TÂM
+# 3. KẺ BẢNG SỐ LIỆU & AI (GEMINI + CHATGPT) BẮT BỆNH NGẮN GỌN TRỌNG TÂM
 # ==============================================================================
 def tinh_chi_so_phu(item):
     tien = item["chi_tieu"]
@@ -349,6 +350,32 @@ def tim_model_gemini():
     return ["models/gemini-2.5-flash-lite", "models/gemini-2.0-flash"]
 
 
+def goi_openai_gpt(prompt_text):
+    """Hàm dự phòng: Gọi ChatGPT (gpt-4o-mini) khi Gemini quá tải hoặc lỗi"""
+    if not OPENAI_KEY:
+        return None
+    url = "https://api.openai.com/v1/chat/completions"
+    headers = {
+        "Authorization": f"Bearer {OPENAI_KEY}",
+        "Content-Type": "application/json"
+    }
+    payload = {
+        "model": "gpt-4o-mini",
+        "messages": [
+            {"role": "system", "content": "Bạn là Giám đốc Tối ưu Quảng cáo Facebook (Senior Media Buyer)."},
+            {"role": "user", "content": prompt_text}
+        ],
+        "temperature": 0.2
+    }
+    try:
+        res = requests.post(url, headers=headers, json=payload, timeout=25).json()
+        if "choices" in res and len(res["choices"]) > 0:
+            return res["choices"][0]["message"]["content"]
+    except Exception as e:
+        print("⚠️ Lỗi gọi OpenAI:", e)
+    return None
+
+
 def gemini_danh_gia_chuyen_sau(tieu_de, du_lieu_text):
     prompt = f"""
     Bạn là Giám đốc Tối ưu Quảng cáo Facebook (Senior Media Buyer).
@@ -379,18 +406,32 @@ def gemini_danh_gia_chuyen_sau(tieu_de, du_lieu_text):
 
     Không dùng ký tự dấu sao (*) hay dấu thăng (#).
     """
-    payload = {
-        "contents": [{"parts": [{"text": prompt}]}],
-        "generationConfig": {"temperature": 0.2},
-    }
-    for m in tim_model_gemini():
-        r = requests.post(
-            f"https://generativelanguage.googleapis.com/v1beta/{m}:generateContent?key={GEMINI_KEY}",
-            json=payload,
-        ).json()
-        if "candidates" in r:
-            return r["candidates"][0]["content"]["parts"][0]["text"]
-    return "⚠️ Không kết nối được Gemini API."
+
+    # 1. Ưu tiên gọi Gemini trước
+    if GEMINI_KEY:
+        payload = {
+            "contents": [{"parts": [{"text": prompt}]}],
+            "generationConfig": {"temperature": 0.2},
+        }
+        for m in tim_model_gemini():
+            try:
+                r = requests.post(
+                    f"https://generativelanguage.googleapis.com/v1beta/{m}:generateContent?key={GEMINI_KEY}",
+                    json=payload,
+                    timeout=20,
+                ).json()
+                if "candidates" in r:
+                    return r["candidates"][0]["content"]["parts"][0]["text"]
+            except Exception:
+                continue
+
+    # 2. Nếu Gemini lỗi hoặc hết hạn mức -> Tự động chuyển sang gọi ChatGPT (OpenAI)
+    if OPENAI_KEY:
+        kq_gpt = goi_openai_gpt(prompt)
+        if kq_gpt:
+            return f"🤖 [Phân tích bởi ChatGPT]\n\n{kq_gpt}"
+
+    return "⚠️ Không kết nối được cả Gemini API và OpenAI API."
 
 
 # ==============================================================================
@@ -442,12 +483,10 @@ def hien_menu_chinh(cid, msg_id=None, tg_mac_dinh="today"):
     gio_hien_tai = lay_gio_viet_nam().strftime("%H:%M - %d/%m/%Y")
     nut_tk = [
         [
-            {"text": "⚡ Báo Cáo Tất Cả (Realtime)", "callback_data": " QuickReport|today"},
+            {"text": "⚡ Báo Cáo Tất Cả (Realtime)", "callback_data": "QuickReport|today"},
             {"text": "📅 Báo Cáo Tất Cả (Hôm qua)", "callback_data": "QuickReport|yesterday"},
         ]
     ]
-    # Sửa lỗi dấu cách trong callback_data dòng trên:
-    nut_tk[0][0]["callback_data"] = "QuickReport|today"
 
     for idx, (tk_idx, tk_info) in enumerate(BO_NHO_BM.items(), 1):
         nut_tk.append([{
@@ -791,7 +830,7 @@ def chay_vong_lap_truc_chien_247(offset_ban_dau=0):
                             tk_cache["data"]["cum_list"],
                             tk_cache["data"]["tong_tien_tk"],
                         )
-                        gui_hoac_sua_menu(cid, bang_text + "\n\n⏳ Gemini đang bắt bệnh toàn bộ các Cụm & Camp...", None, msg_id)
+                        gui_hoac_sua_menu(cid, bang_text + "\n\n⏳ AI đang bắt bệnh toàn bộ các Cụm & Camp...", None, msg_id)
                         nhan_xet = gemini_danh_gia_chuyen_sau(f"Tất cả Cụm & Camp ({tk_cache['ten_tk']})", bang_text)
                         gui_hoac_sua_menu(
                             cid,
@@ -840,7 +879,7 @@ def chay_vong_lap_truc_chien_247(offset_ban_dau=0):
                             c_group["ds_camps"],
                             c_group["chi_tieu"],
                         )
-                        gui_hoac_sua_menu(cid, bang_cum + f"\n\n⏳ Gemini đang bắt bệnh cụm [{ten_cum}]...", None, msg_id)
+                        gui_hoac_sua_menu(cid, bang_cum + f"\n\n⏳ AI đang bắt bệnh cụm [{ten_cum}]...", None, msg_id)
                         nhan_xet = gemini_danh_gia_chuyen_sau(f"Cụm [{ten_cum}] ({tk_cache['ten_tk']})", bang_cum)
                         gui_hoac_sua_menu(
                             cid,
@@ -870,7 +909,7 @@ def chay_vong_lap_truc_chien_247(offset_ban_dau=0):
                             c_info["groups_list"],
                             c_info["chi_tieu"],
                         )
-                        gui_hoac_sua_menu(cid, bang_group + "\n\n⏳ Gemini đang bắt bệnh Camp & các Group...", None, msg_id)
+                        gui_hoac_sua_menu(cid, bang_group + "\n\n⏳ AI đang bắt bệnh Camp & các Group...", None, msg_id)
                         nhan_xet = gemini_danh_gia_chuyen_sau(f"Camp {c_info['ten']}", bang_group)
                         gui_hoac_sua_menu(
                             cid,
@@ -898,7 +937,7 @@ def chay_vong_lap_truc_chien_247(offset_ban_dau=0):
                             g_info["ads_list"],
                             g_info["chi_tieu"],
                         )
-                        gui_hoac_sua_menu(cid, bang_ads + "\n\n⏳ Gemini đang bắt bệnh các Bài Ads...", None, msg_id)
+                        gui_hoac_sua_menu(cid, bang_ads + "\n\n⏳ AI đang bắt bệnh các Bài Ads...", None, msg_id)
                         nhan_xet = gemini_danh_gia_chuyen_sau(f"Group {g_info['ten']}", bang_ads)
                         gui_hoac_sua_menu(
                             cid,
@@ -922,7 +961,7 @@ def chay_vong_lap_truc_chien_247(offset_ban_dau=0):
                             f"• Tệp khách: CPM {a_info['cpm']:,}đ | Lặp (Freq) {a_info['frequency']} | Reach {a_info['reach']:,}\n"
                             f"• Nội dung & Phễu: CTR {a_info['ctr']}% | CPC {a_info['cpc']:,}đ | Click->Mess {a_info['cr_click_to_mess']}%"
                         )
-                        gui_hoac_sua_menu(cid, chi_tiet_ad + "\n\n⏳ Gemini đang bắt bệnh riêng cho Bài Ads này...", None, msg_id)
+                        gui_hoac_sua_menu(cid, chi_tiet_ad + "\n\n⏳ AI đang bắt bệnh riêng cho Bài Ads này...", None, msg_id)
                         nhan_xet_ad = gemini_danh_gia_chuyen_sau(f"Bài Ads {a_info['ten']}", chi_tiet_ad)
                         gui_hoac_sua_menu(
                             cid,
