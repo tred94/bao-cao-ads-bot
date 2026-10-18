@@ -248,7 +248,7 @@ def hien_bang_lich(cid, msg_id=None, target="AUDIT", nam=None, thang=None):
         ten_muc_tieu = f"💳 TK: {ten_tk}"
 
     if ngay_bat_dau:
-        d_ dep = datetime.strptime(ngay_bat_dau, "%Y-%m-%d").strftime("%d/%m/%Y")
+        d_dep = datetime.strptime(ngay_bat_dau, "%Y-%m-%d").strftime("%d/%m/%Y")
         nut.append([
             {"text": f"🔍 Xem ngay 1 ngày ({d_dep})", "callback_data": f"CAL_SINGLE|{target}|{ngay_bat_dau}"},
         ])
