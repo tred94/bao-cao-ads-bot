@@ -5,32 +5,58 @@ import requests
 from datetime import datetime, timezone, timedelta
 
 # ==============================================================================
-# 🛠️ KHU VỰC CẤU HÌNH DỄ CHỈNH SỬA (BẠN CÓ THỂ SỬA TRỰC TIẾP Ở ĐÂY)
+# 🛠️ KHU VỰC CẤU HÌNH DỄ CHỈNH SỬA
 # ==============================================================================
-KPI_MESS = int(os.environ.get("KPI_GIA_MESS", "60000"))       # Mốc KPI giá mỗi tin nhắn (VNĐ)
+KPI_MESS = int(os.environ.get("KPI_GIA_MESS") or "60000")     # Mốc KPI giá mỗi tin nhắn (VNĐ)
 GIO_BAO_CAO_SANG = 8                                          # 8h sáng -> Tự báo số liệu HÔM QUA (yesterday)
 GIO_BAO_CAO_TOI = 20                                          # 20h tối -> Tự báo số liệu HÔM NAY (today)
-THOI_GIAN_DUY_TRI_PHIEN = 54 * 60                            # Giữ Bot thức liên tục 54 phút (nối tiếp mỗi giờ = 24/24)
+THOI_GIAN_DUY_TRI_PHIEN = 54 * 60                             # Giữ Bot thức liên tục 54 phút (nối tiếp mỗi giờ = 24/24)
 
-# Tự động lấy mã bảo mật từ GitHub Secrets
-FB_TOKEN = os.environ.get("FB_ACCESS_TOKEN", "").strip()
-GEMINI_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
-TELE_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
+FB_TOKEN = (os.environ.get("FB_ACCESS_TOKEN") or "").strip()
+GEMINI_KEY = (os.environ.get("GEMINI_API_KEY") or "").strip()
+TELE_TOKEN = (os.environ.get("TELEGRAM_BOT_TOKEN") or "").strip()
 if TELE_TOKEN.startswith("bot"):
     TELE_TOKEN = TELE_TOKEN[3:]
 
-CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "5657736528").strip()
+CHAT_ID = (os.environ.get("TELEGRAM_CHAT_ID") or "5657736528").strip()
 
 BO_NHO_BM = {}
 BO_NHO_TK = {}
-DA_BAO_CAO_TRONG_PHIEN = set()  # Chống gửi trùng báo cáo trong cùng 1 giờ
+DA_BAO_CAO_TRONG_PHIEN = set()
 
 NHAN_THOI_GIAN = {
-    "today": "Hôm nay",
+    "today": "Realtime Hôm nay",
     "yesterday": "Hôm qua",
     "last_3d": "3 ngày qua",
     "last_7d": "7 ngày qua",
 }
+
+# Bàn phím nút bấm cố định luôn nằm ở dưới đáy màn hình Telegram
+BAN_PHIM_CO_DINH = {
+    "keyboard": [
+        [{"text": "🎛 Mở Bảng Điều Khiển"}, {"text": "⚡ Báo Cáo Realtime (Hôm nay)"}],
+        [{"text": "📅 Báo Cáo Hôm Qua"}, {"text": "🔄 Làm Mới Dữ Liệu"}],
+    ],
+    "resize_keyboard": True,
+    "is_persistent": True,
+}
+
+
+# ==============================================================================
+# 0. ĐĂNG KÝ MENU LỆNH KHI GÕ DẤU "/" TRÊN TELEGRAM
+# ==============================================================================
+def cai_dat_menu_lenh_telegram():
+    """Giúp khi bạn gõ dấu '/' trên Telegram sẽ hiện ngay danh sách nút lệnh"""
+    url = f"https://api.telegram.org/bot{TELE_TOKEN}/setMyCommands"
+    commands = [
+        {"command": "menu", "description": "🎛 Mở Bảng điều khiển (Check Realtime)"},
+        {"command": "homnay", "description": "⚡ Xuất báo cáo Realtime Hôm nay"},
+        {"command": "homqua", "description": "📅 Xuất báo cáo tổng kết Hôm qua"},
+    ]
+    try:
+        requests.post(url, json={"commands": commands}, timeout=5)
+    except Exception:
+        pass
 
 
 # ==============================================================================
@@ -88,7 +114,7 @@ def gom_cum_chien_dich(ds_camps_list):
 
 
 # ==============================================================================
-# 2. QUÉT DỮ LIỆU FACEBOOK 5 TẦNG (BM/TK -> CỤM -> CAMP -> GROUP -> ADS)
+# 2. QUÉT DỮ LIỆU FACEBOOK 5 TẦNG (MẶC ĐỊNH REALTIME = TODAY)
 # ==============================================================================
 def trich_xuat_ket_qua(actions_list):
     mess, cmt, lead = 0, 0, 0
@@ -113,7 +139,12 @@ def quet_danh_sach_tai_khoan():
     }
     resp = requests.get(url, params=params).json()
     if "error" in resp:
-        raise Exception(f"Lỗi FB Token: {resp['error'].get('message')}")
+        msg = resp["error"].get("message", "Lỗi không xác định")
+        gui_hoac_sua_menu(
+            CHAT_ID,
+            f"⚠️ Cảnh báo lỗi Facebook Token:\n{msg}\n\n👉 Vui lòng kiểm tra lại FB_ACCESS_TOKEN trong GitHub Secrets.",
+        )
+        raise Exception(f"Lỗi FB Token: {msg}")
 
     ds_tk = {}
     icon_map = {1: "🟢", 2: "🔴", 3: "🟡"}
@@ -129,7 +160,7 @@ def quet_danh_sach_tai_khoan():
     return ds_tk
 
 
-def tai_du_lieu_5_tang(ma_tk, khoang_tg="yesterday"):
+def tai_du_lieu_5_tang(ma_tk, khoang_tg="today"):
     url_camp = f"https://graph.facebook.com/v21.0/{ma_tk}/campaigns"
     r_camp = requests.get(
         url_camp,
@@ -222,6 +253,7 @@ def tai_du_lieu_5_tang(ma_tk, khoang_tg="yesterday"):
         "tong_mess_tk": tong_mess_tk,
         "camps_list": camps_list,
         "cum_list": cum_list,
+        "thoi_diem_cap_nhat": lay_gio_viet_nam().strftime("%H:%M:%S - %d/%m/%Y"),
     }
 
 
@@ -362,8 +394,13 @@ def gemini_danh_gia_chuyen_sau(tieu_de, du_lieu_text):
 
 
 # ==============================================================================
-# 4. HIỂN THỊ GIAO DIỆN ĐA TẦNG TRÊN TELEGRAM
+# 4. HIỂN THỊ GIAO DIỆN ĐA TẦNG & BÀN PHÍM NÚT BẤM CỐ ĐỊNH
 # ==============================================================================
+def gui_ban_phim_co_dinh(chat_id, loi_nhan="⌨️ Đã bật thanh Menu nút bấm nhanh ở dưới đáy màn hình!"):
+    url = f"https://api.telegram.org/bot{TELE_TOKEN}/sendMessage"
+    requests.post(url, json={"chat_id": chat_id, "text": loi_nhan, "reply_markup": BAN_PHIM_CO_DINH})
+
+
 def gui_hoac_sua_menu(chat_id, van_ban, nut_bam=None, msg_id=None):
     if msg_id and len(van_ban) <= 3800:
         url_edit = f"https://api.telegram.org/bot{TELE_TOKEN}/editMessageText"
@@ -388,37 +425,48 @@ def gui_hoac_sua_menu(chat_id, van_ban, nut_bam=None, msg_id=None):
 
     for idx, p in enumerate(cac_phan):
         payload = {"chat_id": chat_id, "text": p}
-        if idx == len(cac_phan) - 1 and nut_bam:
-            payload["reply_markup"] = {"inline_keyboard": nut_bam}
+        if idx == len(cac_phan) - 1:
+            if nut_bam:
+                payload["reply_markup"] = {"inline_keyboard": nut_bam}
+            else:
+                payload["reply_markup"] = BAN_PHIM_CO_DINH
         requests.post(url, json=payload)
 
 
-def hien_menu_chinh(cid, msg_id=None, tg_mac_dinh=None):
+def hien_menu_chinh(cid, msg_id=None, tg_mac_dinh="today"):
+    """MẶC ĐỊNH KHI BẠN CHỦ ĐỘNG BẤM CHECK -> LUÔN LẤY REALTIME HÔM NAY (today)"""
     global BO_NHO_BM
     if not BO_NHO_BM:
         BO_NHO_BM = quet_danh_sach_tai_khoan()
 
-    if not tg_mac_dinh:
-        gio_vn = lay_gio_viet_nam().hour
-        tg_mac_dinh = "yesterday" if gio_vn < 12 else "today"
+    gio_hien_tai = lay_gio_viet_nam().strftime("%H:%M - %d/%m/%Y")
+    nut_tk = [
+        [
+            {"text": "⚡ Báo Cáo Tất Cả (Realtime)", "callback_data": " QuickReport|today"},
+            {"text": "📅 Báo Cáo Tất Cả (Hôm qua)", "callback_data": "QuickReport|yesterday"},
+        ]
+    ]
+    # Sửa lỗi dấu cách trong callback_data dòng trên:
+    nut_tk[0][0]["callback_data"] = "QuickReport|today"
 
-    nut_tk = []
     for idx, (tk_idx, tk_info) in enumerate(BO_NHO_BM.items(), 1):
         nut_tk.append([{
-            "text": f"{tk_info['icon']} {idx}. {tk_info['ten']}",
+            "text": f"{tk_info['icon']} {idx}. {tk_info['ten']} (Xem Realtime)",
             "callback_data": f"TK|{tk_idx}|{tg_mac_dinh}",
         }])
 
     van_ban = (
-        f"🎛 TRUNG TÂM KIỂM TOÁN ADS ĐA TẦNG (ONLINE 24/7)\n"
+        f"🎛 TRUNG TÂM KIỂM TOÁN ADS (REALTIME 24/7)\n"
+        f"🕒 Thời điểm check: {gio_hien_tai}\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"🔍 Đã kết nối {len(BO_NHO_BM)} Tài khoản Quảng cáo.\n"
-        f"👇 Chạm vào Tài khoản bạn muốn kiểm tra:"
+        f"⚡ Mặc định khi bấm vào tài khoản sẽ lấy số liệu REALTIME HÔM NAY (từ 0h00 đến hiện tại).\n\n"
+        f"👇 Chạm vào nút bên dưới để kiểm tra ngay:"
     )
     gui_hoac_sua_menu(cid, van_ban, nut_tk, msg_id)
 
 
-def hien_man_hinh_tai_khoan(cid, tk_idx, tg, msg_id=None, can_tai_lai=True):
+def hien_man_hinh_tai_khoan(cid, tk_idx, tg="today", msg_id=None, can_tai_lai=True):
     global BO_NHO_BM
     if not BO_NHO_BM:
         BO_NHO_BM = quet_danh_sach_tai_khoan()
@@ -429,7 +477,7 @@ def hien_man_hinh_tai_khoan(cid, tk_idx, tg, msg_id=None, can_tai_lai=True):
     if can_tai_lai or tk_idx not in BO_NHO_TK:
         gui_hoac_sua_menu(
             cid,
-            f"⏳ Đang tải số liệu [{tk_info['ten']}]\n📅 Kỳ dữ liệu: {ten_tg}...",
+            f"⏳ Đang quét dữ liệu Realtime [{tk_info['ten']}]\n📅 Kỳ dữ liệu: {ten_tg}...",
             None,
             msg_id,
         )
@@ -448,6 +496,7 @@ def hien_man_hinh_tai_khoan(cid, tk_idx, tg, msg_id=None, can_tai_lai=True):
     tong_tien = du_lieu_tk["tong_tien_tk"]
     tong_mess = du_lieu_tk["tong_mess_tk"]
     gia_tb = int(tong_tien / tong_mess) if tong_mess > 0 else 0
+    luc_cap_nhat = du_lieu_tk.get("thoi_diem_cap_nhat", lay_gio_viet_nam().strftime("%H:%M:%S"))
 
     cum_list = du_lieu_tk.get("cum_list", [])
     dong_cum = []
@@ -460,7 +509,7 @@ def hien_man_hinh_tai_khoan(cid, tk_idx, tg, msg_id=None, can_tai_lai=True):
 
     tom_tat = (
         f"💳 TÀI KHOẢN: {tk_info['ten']}\n"
-        f"📅 Kỳ dữ liệu: {ten_tg}\n"
+        f"📅 Kỳ dữ liệu: {ten_tg} (Cập nhật lúc: {luc_cap_nhat})\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"📌 Tổng: {du_lieu_tk['tong_so_camp']} camp | 🟢 Active: {du_lieu_tk['so_camp_active']} | 🔥 Có tiêu tiền: {du_lieu_tk['so_camp_co_tieu_tien']}\n"
         f"💰 Tổng chi tiêu: {tong_tien:,}đ\n"
@@ -468,10 +517,11 @@ def hien_man_hinh_tai_khoan(cid, tk_idx, tg, msg_id=None, can_tai_lai=True):
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"📦 TỔNG HỢP THEO CỤM TÊN CAMP:\n{text_cum}\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"👇 Đổi thời gian, bấm Đánh giá theo Cụm hoặc bấm vào từng Camp bên dưới:"
+        f"👇 Đổi kỳ dữ liệu, bấm Đánh giá theo Cụm hoặc chọn từng Camp bên dưới:"
     )
 
-    cac_moc = [("today", "Hôm nay"), ("yesterday", "Hôm qua"), ("last_3d", "3 ngày"), ("last_7d", "7 ngày")]
+    # Thanh chọn thời gian: Mặc định tô xanh "✅ Hôm nay" (Realtime)
+    cac_moc = [("today", "⚡ Hôm nay"), ("yesterday", "Hôm qua"), ("last_3d", "3 ngày"), ("last_7d", "7 ngày")]
     hang_thoi_gian = []
     for ma_tg, nhan_ngan in cac_moc:
         hien_thi = f"✅ {nhan_ngan}" if tg == ma_tg else nhan_ngan
@@ -480,6 +530,12 @@ def hien_man_hinh_tai_khoan(cid, tk_idx, tg, msg_id=None, can_tai_lai=True):
             "callback_data": f"TK|{tk_idx}|{ma_tg}",
         })
     nut_camp = [hang_thoi_gian]
+
+    # Nút làm mới Realtime ngay tại chỗ
+    nut_camp.append([{
+        "text": f"🔄 Làm mới số liệu Realtime ({lay_gio_viet_nam().strftime('%H:%M')})",
+        "callback_data": f"TK|{tk_idx}|{tg}",
+    }])
 
     if du_lieu_tk["so_camp_co_tieu_tien"] > 0:
         nut_camp.append([{
@@ -520,6 +576,7 @@ def hien_man_hinh_camp(cid, tk_idx, c_idx, msg_id=None):
     )
     tom_tat_c = (
         f"📂 CHIẾN DỊCH: {c_info['ten']}\n"
+        f"• Kỳ dữ liệu: {NHAN_THOI_GIAN.get(tk_cache['tg'], tk_cache['tg'])}\n"
         f"• Trạng thái: {c_info['trang_thai']} | Số Group: {so_group} nhóm\n"
         f"• Chi tiêu: {c_info['chi_tieu']:,}đ | KQ: {c_info['tin_nhan']} mess ({gia_tb:,}đ/mess)\n\n"
         f"{bang_group}\n"
@@ -572,25 +629,25 @@ def hien_man_hinh_group(cid, tk_idx, c_idx, g_idx, msg_id=None):
 
 
 # ==============================================================================
-# 5. HÀM BÁO CÁO TỰ ĐỘNG CHUẨN XÁC: 8H SÁNG (HÔM QUA) & 20H TỐI (HÔM NAY)
+# 5. HÀM BÁO CÁO TỰ ĐỘNG: 8H SÁNG (HÔM QUA) & 20H TỐI / REALTIME (HÔM NAY)
 # ==============================================================================
-def chay_bao_cao_tu_dong(khoang_tg):
-    """
-    khoang_tg == 'yesterday' -> Báo cáo 8h sáng (số liệu ngày hôm qua)
-    khoang_tg == 'today'     -> Báo cáo 20h tối (số liệu ngày hôm nay)
-    """
+def chay_bao_cao_tu_dong(khoang_tg="today", la_tu_dong_dinh_ky=False):
     global BO_NHO_BM
     BO_NHO_BM = quet_danh_sach_tai_khoan()
     now_vn = lay_gio_viet_nam()
+    gio_str = now_vn.strftime("%H:%M")
     ngay_hom_nay_str = now_vn.strftime("%d/%m/%Y")
     ngay_hom_qua_str = (now_vn - timedelta(days=1)).strftime("%d/%m/%Y")
 
     if khoang_tg == "yesterday":
-        tieu_de_buoi = f"☀️ BÁO CÁO 8H SÁNG — SỐ LIỆU NGÀY HÔM QUA ({ngay_hom_qua_str})"
+        tieu_de_buoi = f"☀️ BÁO CÁO TỔNG KẾT NGÀY HÔM QUA ({ngay_hom_qua_str})"
         ten_ky = f"Hôm qua {ngay_hom_qua_str}"
     else:
-        tieu_de_buoi = f"🌙 BÁO CÁO 20H TỐI — SỐ LIỆU NGÀY HÔM NAY ({ngay_hom_nay_str})"
-        ten_ky = f"Hôm nay {ngay_hom_nay_str}"
+        if la_tu_dong_dinh_ky:
+            tieu_de_buoi = f"🌙 BÁO CÁO 20H TỐI — SỐ LIỆU HÔM NAY ({ngay_hom_nay_str})"
+        else:
+            tieu_de_buoi = f"⚡ BÁO CÁO REALTIME HÔM NAY (Tính đến {gio_str} - {ngay_hom_nay_str})"
+        ten_ky = f"Realtime Hôm nay ({gio_str})"
 
     co_tk_tieu_tien = False
     for tk_idx, tk_info in BO_NHO_BM.items():
@@ -621,44 +678,39 @@ def chay_bao_cao_tu_dong(khoang_tg):
     if not co_tk_tieu_tien:
         gui_hoac_sua_menu(
             CHAT_ID,
-            f"{tieu_de_buoi}\nℹ️ Không có tài khoản nào phát sinh chi tiêu trong kỳ [{ten_ky}].",
+            f"{tieu_de_buoi}\nℹ️ Chưa có tài khoản nào phát sinh chi tiêu trong kỳ [{ten_ky}].",
         )
 
 
 def kiem_tra_den_gio_bao_cao_tu_dong():
-    """Tự động canh đồng hồ giờ Việt Nam ngay trong vòng lặp để nổ báo cáo đúng 8h sáng & 20h tối"""
     now_vn = lay_gio_viet_nam()
     ma_ngay_gio = now_vn.strftime("%Y-%m-%d_%H")
 
-    # Đúng khung 8h sáng (từ 08:00 đến 08:15) -> Báo số liệu HÔM QUA (yesterday)
+    # 8h00 sáng -> Tự động báo số liệu NGÀY HÔM QUA (yesterday)
     if now_vn.hour == GIO_BAO_CAO_SANG and now_vn.minute <= 15 and ma_ngay_gio not in DA_BAO_CAO_TRONG_PHIEN:
         DA_BAO_CAO_TRONG_PHIEN.add(ma_ngay_gio)
-        print("⏰ Đúng 8h00 sáng giờ VN -> Xuất báo cáo HÔM QUA (yesterday)!")
-        chay_bao_cao_tu_dong("yesterday")
-        hien_menu_chinh(CHAT_ID, tg_mac_dinh="yesterday")
+        chay_bao_cao_tu_dong("yesterday", la_tu_dong_dinh_ky=True)
+        hien_menu_chinh(CHAT_ID, tg_mac_dinh="today")
 
-    # Đúng khung 20h tối (từ 20:00 đến 20:15) -> Báo số liệu HÔM NAY (today)
+    # 20h00 tối -> Tự động báo số liệu NGÀY HÔM NAY (today)
     elif now_vn.hour == GIO_BAO_CAO_TOI and now_vn.minute <= 15 and ma_ngay_gio not in DA_BAO_CAO_TRONG_PHIEN:
         DA_BAO_CAO_TRONG_PHIEN.add(ma_ngay_gio)
-        print("⏰ Đúng 20h00 tối giờ VN -> Xuất báo cáo HÔM NAY (today)!")
-        chay_bao_cao_tu_dong("today")
+        chay_bao_cao_tu_dong("today", la_tu_dong_dinh_ky=True)
         hien_menu_chinh(CHAT_ID, tg_mac_dinh="today")
 
 
 # ==============================================================================
-# 6. VÒNG LẶP TRỰC CHIẾN 24/7 (LUÔN THỨC ĐỂ BẤM NÚT & CANH GIỜ BÁO CÁO)
+# 6. VÒNG LẶP TRỰC CHIẾN 24/7
 # ==============================================================================
 def chay_vong_lap_truc_chien_247(offset_ban_dau=0):
     offset = offset_ban_dau
     thoi_diem_bat_dau = time.time()
-    print("🟢 Bot đang trực chiến 24/7 (Vừa canh giờ báo cáo 8h/20h, vừa trực nút bấm Telegram)...")
+    print("🟢 Bot đang trực chiến 24/7 (Mặc định Check Realtime Hôm nay)...")
 
     while time.time() - thoi_diem_bat_dau < THOI_GIAN_DUY_TRI_PHIEN:
         try:
-            # 1. Kiểm tra đồng hồ xem có đúng 8h sáng hoặc 20h tối không
             kiem_tra_den_gio_bao_cao_tu_dong()
 
-            # 2. Lắng nghe tin nhắn & nút bấm từ Telegram theo thời gian thực
             url = f"https://api.telegram.org/bot{TELE_TOKEN}/getUpdates?offset={offset}&timeout=20"
             res = requests.get(url, timeout=25).json()
 
@@ -668,18 +720,33 @@ def chay_vong_lap_truc_chien_247(offset_ban_dau=0):
                 if "message" in update and "text" in update["message"]:
                     cid = update["message"]["chat"]["id"]
                     text_in = update["message"]["text"].strip().lower()
-                    if text_in == "/homqua":
-                        chay_bao_cao_tu_dong("yesterday")
-                    elif text_in == "/homnay":
-                        chay_bao_cao_tu_dong("today")
+
+                    if text_in in ["/homqua", "📅 báo cáo hôm qua"]:
+                        gui_hoac_sua_menu(cid, "⏳ Đang tổng hợp báo cáo NGÀY HÔM QUA cho toàn bộ tài khoản...")
+                        chay_bao_cao_tu_dong("yesterday", la_tu_dong_dinh_ky=False)
+                        hien_menu_chinh(cid, tg_mac_dinh="today")
+
+                    elif text_in in ["/homnay", "⚡ báo cáo realtime (hôm nay)"]:
+                        gui_hoac_sua_menu(cid, "⏳ Đang quét báo cáo REALTIME HÔM NAY cho toàn bộ tài khoản...")
+                        chay_bao_cao_tu_dong("today", la_tu_dong_dinh_ky=False)
+                        hien_menu_chinh(cid, tg_mac_dinh="today")
+
+                    elif text_in in ["🔄 làm mới dữ liệu"]:
+                        BO_NHO_BM.clear()
+                        BO_NHO_TK.clear()
+                        gui_ban_phim_co_dinh(cid, "✅ Đã làm mới bộ nhớ! Đang tải lại số liệu Realtime...")
+                        hien_menu_chinh(cid, tg_mac_dinh="today")
+
                     else:
-                        hien_menu_chinh(cid)
+                        # Bất kỳ tin nhắn hay nút "/menu" nào -> Đều bật bàn phím cố định + Bảng điều khiển Realtime!
+                        gui_ban_phim_co_dinh(cid)
+                        hien_menu_chinh(cid, tg_mac_dinh="today")
 
                 elif "callback_query" in update:
                     cb = update["callback_query"]
                     cid = cb["message"]["chat"]["id"]
                     msg_id = cb["message"]["message_id"]
-                    data = cb["data"]
+                    data = cb["data"].strip()
                     requests.post(
                         f"https://api.telegram.org/bot{TELE_TOKEN}/answerCallbackQuery",
                         json={"callback_query_id": cb["id"]},
@@ -689,7 +756,18 @@ def chay_vong_lap_truc_chien_247(offset_ban_dau=0):
                     lenh = parts[0]
 
                     if lenh == "HOME":
-                        hien_menu_chinh(cid, msg_id)
+                        hien_menu_chinh(cid, msg_id, tg_mac_dinh="today")
+
+                    elif lenh == "QuickReport":
+                        ky_bc = parts[1]
+                        gui_hoac_sua_menu(
+                            cid,
+                            f"⏳ Đang xuất báo cáo [{NHAN_THOI_GIAN.get(ky_bc, ky_bc)}] cho tất cả tài khoản...",
+                            None,
+                            msg_id,
+                        )
+                        chay_bao_cao_tu_dong(ky_bc, la_tu_dong_dinh_ky=False)
+                        hien_menu_chinh(cid, tg_mac_dinh="today")
 
                     elif lenh == "TK":
                         tk_idx, tg = parts[1], parts[2]
@@ -862,20 +940,20 @@ def chay_vong_lap_truc_chien_247(offset_ban_dau=0):
 # 7. KHỞI ĐỘNG HỆ THỐNG
 # ==============================================================================
 if __name__ == "__main__":
+    cai_dat_menu_lenh_telegram()
     event_name = os.environ.get("EVENT_NAME", "")
-    che_do_input = os.environ.get("CHE_DO_INPUT", "menu").strip().lower()
+    che_do_input = (os.environ.get("CHE_DO_INPUT") or "menu").strip().lower()
 
     res_check = requests.get(f"https://api.telegram.org/bot{TELE_TOKEN}/getUpdates?timeout=2").json()
     updates = res_check.get("result", [])
     next_offset = updates[-1]["update_id"] + 1 if updates else 0
 
-    # Nếu bạn bấm nút Run workflow trên GitHub
     if event_name == "workflow_dispatch":
+        gui_ban_phim_co_dinh(CHAT_ID)
         if che_do_input == "yesterday":
-            chay_bao_cao_tu_dong("yesterday")
+            chay_bao_cao_tu_dong("yesterday", la_tu_dong_dinh_ky=False)
         elif che_do_input == "today":
-            chay_bao_cao_tu_dong("today")
-        hien_menu_chinh(CHAT_ID)
+            chay_bao_cao_tu_dong("today", la_tu_dong_dinh_ky=False)
+        hien_menu_chinh(CHAT_ID, tg_mac_dinh="today")
 
-    # Bắt đầu vòng lặp trực chiến 24/7 (tự động canh 8h sáng báo Hôm qua, 20h tối báo Hôm nay)
     chay_vong_lap_truc_chien_247(next_offset)
