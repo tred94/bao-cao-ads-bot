@@ -787,6 +787,11 @@ def chay_vong_lap_truc_chien_247(offset_ban_dau=0):
 
                 if "message" in update and "text" in update["message"]:
                     cid = update["message"]["chat"]["id"]
+                    
+                    # 🔒 KHÓA BẢO MẬT: Chỉ cho phép đúng Chat ID của bạn được tương tác!
+                    if str(cid) != str(CHAT_ID):
+                        continue
+
                     text_in = update["message"]["text"].strip().lower()
 
                     if text_in in ["/homqua", "📅 báo cáo hôm qua"]:
@@ -810,10 +815,15 @@ def chay_vong_lap_truc_chien_247(offset_ban_dau=0):
                         hien_menu_chinh(cid, tg_mac_dinh="today")
 
                 elif "callback_query" in update:
-                    cb = update["callback_query"]
-                    cid = cb["message"]["chat"]["id"]
-                    msg_id = cb["message"]["message_id"]
-                    data = cb["data"].strip()
+        cb = update["callback_query"]
+        cid = cb["message"]["chat"]["id"]
+        
+        # 🔒 KHÓA BẢO MẬT: Chặn tuyệt đối người lạ bấm nút
+        if str(cid) != str(CHAT_ID):
+            continue
+
+        msg_id = cb["message"]["message_id"]
+        data = cb["data"].strip()
 
                     parts = data.split("|")
                     lenh = parts[0]
