@@ -9,6 +9,7 @@ from datetime import datetime, timezone, timedelta
 # 🛠️ KHU VỰC CẤU HÌNH DỄ CHỈNH SỬA
 # ==============================================================================
 KPI_MESS = int(os.environ.get("KPI_GIA_MESS") or "60000")      # Mốc KPI giá mỗi tin nhắn (VNĐ)
+THUE_VAT_FB = float(os.environ.get("THUE_VAT_FB") or "5.0")    # % Thuế VAT Facebook (Mặc định 5%)
 GIO_BAO_CAO_SANG = 8                                           # 8h sáng -> Tự báo số liệu HÔM QUA (yesterday)
 GIO_BAO_CAO_TOI = 20                                           # 20h tối -> Tự báo số liệu HÔM NAY (today)
 THOI_GIAN_DUY_TRI_PHIEN = 54 * 60                              # Giữ Bot thức liên tục 54 phút (nối tiếp mỗi giờ = 24/24)
@@ -27,6 +28,7 @@ AI_UU_TIEN = "gemini"
 
 BO_NHO_BM = {}
 BO_NHO_TK = {}
+BO_NHO_AUDIT = {}
 DA_BAO_CAO_TRONG_PHIEN = set()
 
 NHAN_THOI_GIAN = {
@@ -43,8 +45,8 @@ NHAN_THOI_GIAN = {
 BAN_PHIM_CO_DINH = {
     "keyboard": [
         [{"text": "🎛 Mở Bảng Điều Khiển"}, {"text": "⚡ Báo Cáo Realtime (Hôm nay)"}],
-        [{"text": "📅 Báo Cáo Hôm Qua"}, {"text": "💰 Rà Soát Chi Tiêu (Tháng/Ngày)"}],
-        [{"text": "🔄 Làm Mới Dữ Liệu"}],
+        [{"text": "💰 Rà Soát Chi Tiêu (Tháng/Ngày)"}, {"text": "💳 Kiểm Tra Công Nợ & Thẻ"}],
+        [{"text": "📅 Báo Cáo Hôm Qua"}, {"text": "🔄 Làm Mới Dữ Liệu"}],
     ],
     "resize_keyboard": True,
     "is_persistent": True,
@@ -55,11 +57,11 @@ BAN_PHIM_CO_DINH = {
 # 0. ĐĂNG KÝ MENU LỆNH KHI GÕ DẤU "/" TRÊN TELEGRAM
 # ==============================================================================
 def cai_dat_menu_lenh_telegram():
-    """Giúp khi bạn gõ dấu '/' trên Telegram sẽ hiện ngay danh sách nút lệnh"""
     url = f"https://api.telegram.org/bot{TELE_TOKEN}/setMyCommands"
     commands = [
         {"command": "menu", "description": "🎛 Mở Bảng điều khiển (Check Realtime)"},
-        {"command": "rasoat", "description": "💰 Rà soát tổng chi tiêu Tháng / Ngày tùy chỉnh"},
+        {"command": "rasoat", "description": "💰 Rà soát ngân sách theo TK / Cụm / Nhóm"},
+        {"command": "congno", "description": "💳 Kiểm tra Công nợ, Ngưỡng & Trạng thái Thẻ"},
         {"command": "homnay", "description": "⚡ Xuất báo cáo Realtime Hôm nay"},
         {"command": "homqua", "description": "📅 Xuất báo cáo tổng kết Hôm qua"},
     ]
@@ -105,6 +107,8 @@ def gom_cum_chien_dich(ds_camps_list):
                 "clicks": 0,
                 "impressions": 0,
                 "reach": 0,
+                "video_3s": 0,
+                "thruplay": 0,
                 "ds_camps": [],
             }
         g = cum_dict[ten_cum]
@@ -115,6 +119,8 @@ def gom_cum_chien_dich(ds_camps_list):
         g["clicks"] += c_info["clicks"]
         g["impressions"] += c_info["impressions"]
         g["reach"] += c_info["reach"]
+        g["video_3s"] += c_info.get("video_3s", 0)
+        g["thruplay"] += c_info.get("thruplay", 0)
         g["ds_camps"].append(c_info)
 
     ds_cum_sorted = sorted(cum_dict.values(), key=lambda x: x["chi_tieu"], reverse=True)
@@ -130,7 +136,6 @@ def phan_tich_ngay_tuy_chinh(text_in):
 
     s = re.sub(r"^(/ngay|/rasoat|ngay|ngày)\s*", "", text_in.strip(), flags=re.IGNORECASE).strip()
 
-    # Trường hợp khoảng ngày: DD/MM(/YYYY) - DD/MM(/YYYY)
     m_range = re.match(
         r"^(\d{1,2})[\/\-](\d{1,2})(?:[\/\-](\d{2,4}))?\s*(?:đến|den|to|\-|\~)\s*(\d{1,2})[\/\-](\d{1,2})(?:[\/\-](\d{2,4}))?$",
         s,
@@ -156,7 +161,6 @@ def phan_tich_ngay_tuy_chinh(text_in):
         except ValueError:
             return None
 
-    # Trường hợp 1 ngày duy nhất: DD/MM(/YYYY)
     m_single = re.match(r"^(\d{1,2})[\/\-](\d{1,2})(?:[\/\-](\d{2,4}))?$", s)
     if m_single:
         d1, m1, y1 = m_single.groups()
@@ -174,10 +178,10 @@ def phan_tich_ngay_tuy_chinh(text_in):
 
 
 # ==============================================================================
-# 2. QUÉT DỮ LIỆU FACEBOOK 5 TẦNG & RÀ SOÁT TỔNG CHI TIÊU
+# 2. QUÉT DỮ LIỆU FACEBOOK 5 TẦNG (KÈM HOOK RATE, HOLD RATE & CÔNG NỢ)
 # ==============================================================================
-def trich_xuat_ket_qua(actions_list):
-    mess, cmt, lead = 0, 0, 0
+def trich_xuat_ket_qua(actions_list, video_thruplay_list=None):
+    mess, cmt, lead, video_3s, thruplay = 0, 0, 0, 0, 0
     for item in actions_list or []:
         loai = item.get("action_type", "")
         val = int(float(item.get("value", 0)))
@@ -187,13 +191,19 @@ def trich_xuat_ket_qua(actions_list):
             cmt = val
         elif loai in ["lead", "purchase", "onsite_conversion.lead_grouped"]:
             lead += val
-    return mess, cmt, lead
+        elif loai == "video_view":
+            video_3s = val
+
+    for v_item in video_thruplay_list or []:
+        thruplay += int(float(v_item.get("value", 0)))
+
+    return mess, cmt, lead, video_3s, thruplay
 
 
 def quet_danh_sach_tai_khoan():
     url = "https://graph.facebook.com/v21.0/me/adaccounts"
     params = {
-        "fields": "id,name,account_status,amount_spent",
+        "fields": "id,name,account_status,disable_reason,amount_spent,balance,spend_cap,ad_trust_dsl,currency",
         "limit": 200,
         "access_token": FB_TOKEN,
     }
@@ -207,59 +217,120 @@ def quet_danh_sach_tai_khoan():
         raise Exception(f"Lỗi FB Token: {msg}")
 
     ds_tk = {}
-    icon_map = {1: "🟢", 2: "🔴", 3: "🟡"}
+    icon_map = {1: "🟢", 2: "🔴", 3: "🟡", 7: "🟠", 9: "⏳"}
+    status_text_map = {
+        1: "Đang hoạt động",
+        2: "Vô hiệu hóa (Disabled)",
+        3: "Nợ cước / Lỗi thanh toán",
+        7: "Đang xét duyệt",
+        9: "Trong thời gian ân hạn nợ",
+    }
     for idx, acc in enumerate(resp.get("data", [])):
         tk_idx = str(idx)
         st_code = acc.get("account_status", 1)
+        currency = acc.get("currency", "VND")
+        he_so = 1 if currency == "VND" else 100
+
+        balance_raw = int(float(acc.get("balance", 0))) // he_so
+        spent_raw = int(float(acc.get("amount_spent", 0))) // he_so
+        threshold_raw = int(float(acc.get("ad_trust_dsl", 0)))
+
         ds_tk[tk_idx] = {
             "tk_idx": tk_idx,
             "id": acc.get("id"),
             "ten": acc.get("name") or acc.get("id"),
             "icon": icon_map.get(st_code, "⚪"),
+            "status_code": st_code,
+            "status_text": status_text_map.get(st_code, f"Mã {st_code}"),
+            "balance": balance_raw,
+            "amount_spent": spent_raw,
+            "threshold": threshold_raw,
+            "currency": currency,
         }
     return ds_tk
 
 
-def rà_soat_chi_tieu_bm(che_do="this_month", since_date=None, until_date=None, nhan_hien_thi=""):
-    """Quét nhanh tổng chi tiêu, tin nhắn, bình luận của toàn bộ tài khoản theo Tháng hoặc Ngày tùy chỉnh"""
+def tao_bao_cao_cong_no_va_the():
+    """Tiện ích số 3: Kiểm tra Công nợ, Ngưỡng thanh toán (Threshold) & Cảnh báo Thẻ lỗi"""
     global BO_NHO_BM
+    BO_NHO_BM = quet_danh_sach_tai_khoan()
+
+    tong_no_bm = 0
+    so_tk_loi = 0
+    lines = [
+        "💳 KIỂM TRA CÔNG NỢ, NGƯỠNG (THRESHOLD) & TRẠNG THÁI THẺ",
+        f"🕒 Cập nhật: {lay_gio_viet_nam().strftime('%H:%M:%S - %d/%m/%Y')}",
+        "━━━━━━━━━━━━━━━━━━━━",
+    ]
+
+    ds_acc = sorted(BO_NHO_BM.values(), key=lambda x: (x["status_code"] != 1, -x["balance"]))
+
+    for idx, acc in enumerate(ds_acc, 1):
+        no_hien_tai = acc["balance"]
+        nguong = acc["threshold"]
+        tong_tieu = acc["amount_spent"]
+        tong_no_bm += no_hien_tai
+
+        if acc["status_code"] != 1:
+            so_tk_loi += 1
+
+        ty_le_cham_nguong = round((no_hien_tai / nguong) * 100, 1) if nguong > 0 else 0
+        canh_bao_nguong = " ⚠️ (Sắp chạm ngưỡng!)" if ty_le_cham_nguong >= 85 else ""
+        canh_bao_the = " 🚨 [CẢNH BÁO LỖI THẺ / TÀI KHOẢN!]" if acc["status_code"] in [2, 3, 9] else ""
+
+        nguong_str = f"{nguong:,}đ ({ty_le_cham_nguong}%){canh_bao_nguong}" if nguong > 0 else "Chưa xác định"
+        lines.append(
+            f"{idx}. {acc['icon']} {acc['ten']}{canh_bao_the}\n"
+            f"   • Trạng thái: {acc['status_text']}\n"
+            f"   • Dư nợ hiện tại: {no_hien_tai:,}đ | Ngưỡng: {nguong_str}\n"
+            f"   • Tổng đã tiêu (Lũy kế): {tong_tieu:,}đ"
+        )
+
+    thue_du_kien = int(tong_no_bm * (THUE_VAT_FB / 100.0))
+    tong_can_chuan_bi = tong_no_bm + thue_du_kien
+
+    tom_tat_dau = [
+        f"💰 TỔNG DƯ NỢ HIỆN TẠI: {tong_no_bm:,}đ",
+        f"🧾 Thuế VAT dự kiến ({THUE_VAT_FB}%): +{thue_du_kien:,}đ",
+        f"🏦 Tổng tiền cần chuẩn bị trong thẻ: {tong_can_chuan_bi:,}đ",
+    ]
+    if so_tk_loi > 0:
+        tom_tat_dau.append(f"🚨 CẢNH BÁO: Có {so_tk_loi} tài khoản đang gặp sự cố thanh toán hoặc bị khóa!")
+    else:
+        tom_tat_dau.append("✅ Toàn bộ tài khoản đều đang hoạt động bình thường.")
+    tom_tat_dau.append("━━━━━━━━━━━━━━━━━━━━")
+
+    return "\n".join(lines[:3] + tom_tat_dau + lines[3:])
+
+
+def rà_soat_chi_tieu_bm(che_do="this_month", since_date=None, until_date=None, nhan_hien_thi=""):
+    """Rà soát chi tiêu theo Tài khoản + Cụm Chiến dịch + Nhóm Quảng cáo (AdSet) + Tính thuế VAT"""
+    global BO_NHO_BM, BO_NHO_AUDIT
     if not BO_NHO_BM:
         BO_NHO_BM = quet_danh_sach_tai_khoan()
 
+    BO_NHO_AUDIT.clear()
     tong_chi_bm = 0
     tong_mess_bm = 0
     tong_cmt_bm = 0
     ds_ket_qua = []
 
     for tk_idx, tk_info in BO_NHO_BM.items():
-        url_ins = f"https://graph.facebook.com/v21.0/{tk_info['id']}/insights"
-        params = {
-            "level": "account",
-            "fields": "spend,impressions,reach,clicks,ctr,cpm,actions",
-            "access_token": FB_TOKEN,
-        }
-        if since_date and until_date:
-            params["time_range"] = json.dumps({"since": since_date, "until": until_date})
-        else:
-            params["date_preset"] = che_do
-
-        try:
-            r = requests.get(url_ins, params=params, timeout=15).json()
-            data = r.get("data", [])
-            if data:
-                row = data[0]
-                spend = int(float(row.get("spend", 0)))
-                mess, cmt, _ = trich_xuat_ket_qua(row.get("actions", []))
-                clicks = int(float(row.get("clicks", 0)))
-                impr = int(float(row.get("impressions", 0)))
-            else:
-                spend, mess, cmt, clicks, impr = 0, 0, 0, 0, 0
-        except Exception:
-            spend, mess, cmt, clicks, impr = 0, 0, 0, 0, 0
+        du_lieu_tk = tai_du_lieu_5_tang(tk_info["id"], khoang_tg=che_do, since_date=since_date, until_date=until_date)
+        spend = du_lieu_tk["tong_tien_tk"]
+        mess = du_lieu_tk["tong_mess_tk"]
+        cmt = sum(c["binh_luan"] for c in du_lieu_tk["camps_list"])
 
         tong_chi_bm += spend
         tong_mess_bm += mess
         tong_cmt_bm += cmt
+
+        if spend > 0:
+            BO_NHO_AUDIT[tk_idx] = {
+                "ten_tk": tk_info["ten"],
+                "nhan_hien_thi": nhan_hien_thi,
+                "data": du_lieu_tk,
+            }
 
         ds_ket_qua.append({
             "tk_idx": tk_idx,
@@ -268,50 +339,114 @@ def rà_soat_chi_tieu_bm(che_do="this_month", since_date=None, until_date=None, 
             "spend": spend,
             "mess": mess,
             "cmt": cmt,
-            "clicks": clicks,
-            "impr": impr,
+            "cum_list": du_lieu_tk["cum_list"],
+            "camps_list": du_lieu_tk["camps_list"],
         })
 
     ds_ket_qua.sort(key=lambda x: x["spend"], reverse=True)
     gia_tb_bm = int(tong_chi_bm / tong_mess_bm) if tong_mess_bm > 0 else 0
+    tien_thue = int(tong_chi_bm * (THUE_VAT_FB / 100.0))
+    tong_sau_thue = tong_chi_bm + tien_thue
 
     lines = [
-        f"💰 BẢNG RÀ SOÁT TỔNG CHI TIÊU TÀI KHOẢN",
+        f"💰 BẢNG RÀ SOÁT NGÂN SÁCH (TÀI KHOẢN / CỤM / NHÓM)",
         f"📅 Kỳ rà soát: {nhan_hien_thi}",
         f"🕒 Cập nhật: {lay_gio_viet_nam().strftime('%H:%M:%S - %d/%m/%Y')}",
         "━━━━━━━━━━━━━━━━━━━━",
-        f"🔥 TỔNG CHI TIÊU TOÀN BM: {tong_chi_bm:,}đ",
-        f"💬 Tổng tin nhắn: {tong_mess_bm:,} mess (TB: {gia_tb_bm:,}đ/mess)",
-        f"💭 Tổng bình luận: {tong_cmt_bm:,} cmt",
+        f"🔥 TỔNG CHI TIÊU ADS: {tong_chi_bm:,}đ",
+        f"🧾 Thuế VAT ({THUE_VAT_FB}%): +{tien_thue:,}đ",
+        f"💳 TỔNG THỰC TRỪ THẺ: {tong_sau_thue:,}đ",
+        f"💬 Tổng kết quả: {tong_mess_bm:,} mess (TB: {gia_tb_bm:,}đ/mess) | {tong_cmt_bm:,} cmt",
         "━━━━━━━━━━━━━━━━━━━━",
-        "📋 CHI TIẾT TỪNG TÀI KHOẢN:",
+        "📋 CHI TIẾT TỪNG TÀI KHOẢN & CỤM CHIẾN DỊCH:",
     ]
 
+    nut_xem_nhom = []
     co_tk_tieu = False
     for idx, item in enumerate(ds_ket_qua, 1):
         if item["spend"] > 0:
             co_tk_tieu = True
             gia_m = int(item["spend"] / item["mess"]) if item["mess"] > 0 else 0
             ty_trong = round((item["spend"] / tong_chi_bm) * 100, 1) if tong_chi_bm > 0 else 0
+            thue_tk = int(item["spend"] * (THUE_VAT_FB / 100.0))
             lines.append(
-                f"{idx}. {item['icon']} {item['ten']}\n"
-                f"   • Chi tiêu: {item['spend']:,}đ ({ty_trong}%)\n"
-                f"   • Kết quả: {item['mess']} mess ({gia_m:,}đ/mess) | {item['cmt']} cmt"
+                f"\n{idx}. {item['icon']} {item['ten']}\n"
+                f"   💵 Chi tiêu: {item['spend']:,}đ ({ty_trong}%) | +Thuế: { item['spend'] + thue_tk:,}đ\n"
+                f"   💬 Kết quả: {item['mess']} mess ({gia_m:,}đ/mess) | {item['cmt']} cmt"
             )
+            # Liệt kê từng Cụm bên trong Tài khoản
+            for c_gr in item["cum_list"]:
+                g_cum = int(c_gr["chi_tieu"] / c_gr["tin_nhan"]) if c_gr["tin_nhan"] > 0 else 0
+                lines.append(
+                    f"   🔹 Cụm [{c_gr['ten_cum']}] ({c_gr['so_camp']} camp): {c_gr['chi_tieu']:,}đ | {c_gr['tin_nhan']} mess ({int(g_cum/1000)}k)"
+                )
+
+            nut_xem_nhom.append([{
+                "text": f"📂 Soi chi tiết Nhóm (AdSet) của: {item['ten'][:22]}",
+                "callback_data": f"AUDIT_TK|{item['tk_idx']}",
+            }])
         else:
-            lines.append(f"{idx}. {item['icon']} {item['ten']}: 0đ (Không chi tiêu)")
+            lines.append(f"\n{idx}. {item['icon']} {item['ten']}: 0đ (Không chi tiêu)")
 
     if not co_tk_tieu:
         lines.append("\nℹ️ Không có tài khoản nào phát sinh chi tiêu trong khoảng thời gian này.")
 
     lines.append("━━━━━━━━━━━━━━━━━━━━")
     lines.append(
-        "💡 MẸO TRA CỨU NGÀY TÙY CHỈNH:\n"
-        "Bạn có thể gõ trực tiếp ngày vào ô chat bất cứ lúc nào theo cú pháp:\n"
-        "• Xem 1 ngày: 15/10 hoặc 15/10/2026\n"
-        "• Xem khoảng ngày: 01/10 - 15/10"
+        "💡 Gõ trực tiếp ngày (VD: 15/10 hoặc 01/10 - 15/10) vào ô chat để rà soát ngày bất kỳ."
     )
-    return "\n".join(lines)
+
+    nut_xem_nhom.append([{"text": "💰 Chọn mốc Rà soát khác", "callback_data": "MENU_AUDIT"}])
+    nut_xem_nhom.append([{"text": "🏠 Về Bảng Điều Khiển Chính", "callback_data": "HOME"}])
+    return "\n".join(lines), nut_xem_nhom
+
+
+def tao_bang_chi_tiet_nhom_audit(tk_idx):
+    """Hiển thị toàn bộ các Nhóm quảng cáo (AdSet) đã tiêu tiền trong kỳ Rà soát của 1 Tài khoản"""
+    if tk_idx not in BO_NHO_AUDIT:
+        return "⚠️ Dữ liệu rà soát đã làm mới, vui lòng chọn lại mốc rà soát.", [[{"text": "⬅️ Quay lại", "callback_data": "MENU_AUDIT"}]]
+
+    info = BO_NHO_AUDIT[tk_idx]
+    ten_tk = info["ten_tk"]
+    nhan_tg = info["nhan_hien_thi"]
+    du_lieu = info["data"]
+    tong_tien_tk = du_lieu["tong_tien_tk"]
+
+    lines = [
+        f"📂 RÀ SOÁT CHI TIẾT THEO NHÓM (ADSET)",
+        f"💳 Tài khoản: {ten_tk}",
+        f"📅 Kỳ rà soát: {nhan_tg}",
+        f"💰 Tổng tiêu TK: {tong_tien_tk:,}đ (+Thuế {THUE_VAT_FB}%: {int(tong_tien_tk * (1 + THUE_VAT_FB/100)):,}đ)",
+        "━━━━━━━━━━━━━━━━━━━━",
+    ]
+
+    for c_idx, camp in enumerate(du_lieu["camps_list"], 1):
+        gia_c = int(camp["chi_tieu"] / camp["tin_nhan"]) if camp["tin_nhan"] > 0 else 0
+        lines.append(
+            f"📌 Camp {c_idx}: {camp['ten']}\n"
+            f"   Tổng Camp: {camp['chi_tieu']:,}đ | {camp['tin_nhan']} mess ({int(gia_c/1000)}k/mess)"
+        )
+        for g_idx, grp in enumerate(camp["groups_list"], 1):
+            gia_g = int(grp["chi_tieu"] / grp["tin_nhan"]) if grp["tin_nhan"] > 0 else 0
+            ctr, cpm, freq, cr_mess, hook_r, hold_r = tinh_chi_so_phu(grp)
+            icon_dg = "🟢" if (grp["tin_nhan"] > 0 and gia_g <= KPI_MESS) else ("🔴" if grp["tin_nhan"] == 0 else "🟡")
+            video_str = f" | 🎬 Hook:{hook_r}% Hold:{hold_r}%" if hook_r > 0 else ""
+            lines.append(
+                f"   ↳ Nhóm {g_idx} [{grp['ten']}]: {grp['chi_tieu']:,}đ | {grp['tin_nhan']} mess ({int(gia_g/1000)}k) {icon_dg}\n"
+                f"      [CPM:{int(cpm/1000)}k | CTR:{ctr}% | CR:{cr_mess}%{video_str}]"
+            )
+        lines.append("")
+
+    lines.append("━━━━━━━━━━━━━━━━━━━━")
+    nut_bam = [
+        [
+            {"text": "✨ Gemini Đánh Giá Kỳ Này", "callback_data": f"AI_AUDIT|{tk_idx}|gemini"},
+            {"text": "🤖 ChatGPT Đánh Giá Kỳ Này", "callback_data": f"AI_AUDIT|{tk_idx}|chatgpt"},
+        ],
+        [{"text": "⬅️ Quay lại Menu Rà Soát", "callback_data": "MENU_AUDIT"}],
+        [{"text": "🏠 Về Bảng Điều Khiển Chính", "callback_data": "HOME"}],
+    ]
+    return "\n".join(lines), nut_bam
 
 
 def hien_menu_ra_soat(cid, msg_id=None):
@@ -321,12 +456,12 @@ def hien_menu_ra_soat(cid, msg_id=None):
     thang_truoc_str = thang_truoc_dt.strftime("%m/%Y")
 
     van_ban = (
-        f"💰 TRUNG TÂM RÀ SOÁT TỔNG CHI TIÊU\n"
+        f"💰 TRUNG TÂM RÀ SOÁT TỔNG CHI TIÊU (TK / CỤM / NHÓM)\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"Chọn nhanh mốc thời gian bên dưới để tổng hợp chi tiêu của toàn bộ Tài khoản Quảng cáo:\n\n"
+        f"Chọn nhanh mốc thời gian bên dưới để tổng hợp chi tiêu kèm Thuế VAT ({THUE_VAT_FB}%) và chi tiết từng Cụm / Nhóm:\n\n"
         f"✍️ HOẶC GÕ TRỰC TIẾP NGÀY TÙY CHỈNH VÀO Ô CHAT:\n"
         f"• Gõ 1 ngày: 15/10 hoặc 15/10/2026\n"
-        f"• Gõ nhiều ngày: 01/10 - 15/10\n"
+        f"• Gõ khoảng ngày: 01/10 - 15/10\n"
     )
 
     nut_bam = [
@@ -347,7 +482,7 @@ def hien_menu_ra_soat(cid, msg_id=None):
     gui_hoac_sua_menu(cid, van_ban, nut_bam, msg_id)
 
 
-def tai_du_lieu_5_tang(ma_tk, khoang_tg="today"):
+def tai_du_lieu_5_tang(ma_tk, khoang_tg="today", since_date=None, until_date=None):
     url_camp = f"https://graph.facebook.com/v21.0/{ma_tk}/campaigns"
     r_camp = requests.get(
         url_camp,
@@ -364,11 +499,15 @@ def tai_du_lieu_5_tang(ma_tk, khoang_tg="today"):
     url_ins = f"https://graph.facebook.com/v21.0/{ma_tk}/insights"
     params = {
         "level": "ad",
-        "date_preset": khoang_tg,
-        "fields": "campaign_id,campaign_name,adset_id,adset_name,ad_id,ad_name,spend,reach,impressions,frequency,cpm,clicks,ctr,cpc,actions",
+        "fields": "campaign_id,campaign_name,adset_id,adset_name,ad_id,ad_name,spend,reach,impressions,frequency,cpm,clicks,ctr,cpc,actions,video_thruplay_watched_actions",
         "limit": 500,
         "access_token": FB_TOKEN,
     }
+    if since_date and until_date:
+        params["time_range"] = json.dumps({"since": since_date, "until": until_date})
+    else:
+        params["date_preset"] = khoang_tg
+
     r_ins = requests.get(url_ins, params=params).json()
     camps_raw = {}
     tong_tien_tk, tong_mess_tk = 0, 0
@@ -380,7 +519,9 @@ def tai_du_lieu_5_tang(ma_tk, khoang_tg="today"):
         c_id, c_name = row.get("campaign_id"), row.get("campaign_name", "Không tên")
         g_id, g_name = row.get("adset_id"), row.get("adset_name", "Không tên")
         a_id, a_name = row.get("ad_id"), row.get("ad_name", "Không tên")
-        mess, cmt, _ = trich_xuat_ket_qua(row.get("actions", []))
+        mess, cmt, _, video_3s, thruplay = trich_xuat_ket_qua(
+            row.get("actions", []), row.get("video_thruplay_watched_actions", [])
+        )
         clicks = int(float(row.get("clicks", 0)))
         impr = int(float(row.get("impressions", 0)))
         reach = int(float(row.get("reach", 0)))
@@ -394,25 +535,34 @@ def tai_du_lieu_5_tang(ma_tk, khoang_tg="today"):
                 "ten": c_name,
                 "trang_thai": trang_thai_camp.get(c_id, "🟢 Có tiêu tiền"),
                 "chi_tieu": 0, "tin_nhan": 0, "binh_luan": 0,
-                "clicks": 0, "impressions": 0, "reach": 0, "groups_raw": {},
+                "clicks": 0, "impressions": 0, "reach": 0,
+                "video_3s": 0, "thruplay": 0, "groups_raw": {},
             }
         c = camps_raw[c_id]
         c["chi_tieu"] += spend; c["tin_nhan"] += mess; c["binh_luan"] += cmt
         c["clicks"] += clicks; c["impressions"] += impr; c["reach"] += reach
+        c["video_3s"] += video_3s; c["thruplay"] += thruplay
 
         if g_id not in c["groups_raw"]:
             c["groups_raw"][g_id] = {
                 "id": g_id, "ten": g_name, "chi_tieu": 0, "tin_nhan": 0,
-                "binh_luan": 0, "clicks": 0, "impressions": 0, "reach": 0, "ads_raw": {},
+                "binh_luan": 0, "clicks": 0, "impressions": 0, "reach": 0,
+                "video_3s": 0, "thruplay": 0, "ads_raw": {},
             }
         g = c["groups_raw"][g_id]
         g["chi_tieu"] += spend; g["tin_nhan"] += mess; g["binh_luan"] += cmt
         g["clicks"] += clicks; g["impressions"] += impr; g["reach"] += reach
+        g["video_3s"] += video_3s; g["thruplay"] += thruplay
+
+        hook_rate = round((video_3s / impr) * 100, 1) if impr > 0 and video_3s > 0 else 0
+        hold_rate = round((thruplay / video_3s) * 100, 1) if video_3s > 0 and thruplay > 0 else 0
 
         g["ads_raw"][a_id] = {
             "id": a_id, "ten": a_name, "chi_tieu": spend, "tin_nhan": mess,
             "gia_mess": int(spend / mess) if mess > 0 else 0, "binh_luan": cmt,
             "clicks": clicks, "impressions": impr, "reach": reach,
+            "video_3s": video_3s, "thruplay": thruplay,
+            "hook_rate": hook_rate, "hold_rate": hold_rate,
             "ctr": round(float(row.get("ctr", 0)), 2), "cpc": int(float(row.get("cpc", 0))),
             "cpm": int(float(row.get("cpm", 0))), "frequency": round(float(row.get("frequency", 0)), 2),
             "cr_click_to_mess": round((mess / clicks) * 100, 1) if clicks > 0 else 0,
@@ -445,7 +595,7 @@ def tai_du_lieu_5_tang(ma_tk, khoang_tg="today"):
 
 
 # ==============================================================================
-# 3. KẺ BẢNG SỐ LIỆU & AI (GEMINI + CHATGPT) BẮT BỆNH NGẮN GỌN TRỌNG TÂM
+# 3. KẺ BẢNG SỐ LIỆU (KÈM HOOK/HOLD VIDEO) & AI BẮT BỆNH CHUYÊN SÂU
 # ==============================================================================
 def tinh_chi_so_phu(item):
     tien = item["chi_tieu"]
@@ -453,12 +603,16 @@ def tinh_chi_so_phu(item):
     impr = item.get("impressions", 0)
     reach = item.get("reach", 0)
     clicks = item.get("clicks", 0)
+    video_3s = item.get("video_3s", 0)
+    thruplay = item.get("thruplay", 0)
 
     ctr = item.get("ctr") if "ctr" in item else (round((clicks / impr) * 100, 2) if impr > 0 else 0)
     cpm = item.get("cpm") if "cpm" in item else (int((tien / impr) * 1000) if impr > 0 else 0)
     freq = item.get("frequency") if "frequency" in item else (round(impr / reach, 2) if reach > 0 else 1.0)
     cr_mess = item.get("cr_click_to_mess") if "cr_click_to_mess" in item else (round((mess / clicks) * 100, 1) if clicks > 0 else 0)
-    return ctr, cpm, freq, cr_mess
+    hook_rate = item.get("hook_rate") if "hook_rate" in item else (round((video_3s / impr) * 100, 1) if impr > 0 and video_3s > 0 else 0)
+    hold_rate = item.get("hold_rate") if "hold_rate" in item else (round((thruplay / video_3s) * 100, 1) if video_3s > 0 and thruplay > 0 else 0)
+    return ctr, cpm, freq, cr_mess, hook_rate, hold_rate
 
 
 def tao_bang_so_sanh_text(tieu_de, ds_items, tong_tien_cha):
@@ -468,7 +622,7 @@ def tao_bang_so_sanh_text(tieu_de, ds_items, tong_tien_cha):
         tien, mess = item["chi_tieu"], item["tin_nhan"]
         gia = int(tien / mess) if mess > 0 else 0
         ty_trong = round((tien / tong_tien_cha) * 100, 1) if tong_tien_cha > 0 else 0
-        ctr, cpm, freq, cr_mess = tinh_chi_so_phu(item)
+        ctr, cpm, freq, cr_mess, hook_r, hold_r = tinh_chi_so_phu(item)
 
         danh_gia = (
             "🔴 LỖ (0 mess)"
@@ -479,10 +633,11 @@ def tao_bang_so_sanh_text(tieu_de, ds_items, tong_tien_cha):
                 else f"🟡 ĐẮT ({int(gia/1000)}k/mess)"
             )
         )
+        dong_video = f"\n   • 🎬 Video: Hook (3s) {hook_r}% | Hold (Giữ chân) {hold_r}%" if hook_r > 0 else ""
         lines.append(
             f"{idx}. {item['ten']} [{danh_gia}]\n"
             f"   • Tiêu: {tien:,}đ ({ty_trong}%) | KQ: {mess} mess | {item.get('binh_luan', 0)} cmt\n"
-            f"   • Tệp: CPM {int(cpm/1000)}k, Lặp {freq} | Content: CTR {ctr}%, Click->Mess {cr_mess}%"
+            f"   • Tệp: CPM {int(cpm/1000)}k, Lặp {freq} | Content: CTR {ctr}%, Click->Mess {cr_mess}%{dong_video}"
         )
     lines.append("━━━━━━━━━━━━━━━━━━━━")
     return "\n".join(lines)
@@ -503,10 +658,11 @@ def tao_bang_gom_cum_text(ten_tk, cum_list, tong_tien_tk):
         )
         for sub in sorted(c_group["ds_camps"], key=lambda x: x["chi_tieu"], reverse=True):
             sub_gia = int(sub["chi_tieu"] / sub["tin_nhan"]) if sub["tin_nhan"] > 0 else 0
-            ctr, cpm, freq, cr_mess = tinh_chi_so_phu(sub)
+            ctr, cpm, freq, cr_mess, hook_r, hold_r = tinh_chi_so_phu(sub)
             icon_dg = "🟢" if (sub["tin_nhan"] > 0 and sub_gia <= KPI_MESS) else ("🔴" if sub["tin_nhan"] == 0 else "🟡")
+            vid_info = f" | 🎬Hook:{hook_r}% Hold:{hold_r}%" if hook_r > 0 else ""
             lines.append(
-                f"   • {sub['ten']}: {sub['chi_tieu']:,}đ | {sub['tin_nhan']} mess ({int(sub_gia/1000)}k) {icon_dg} [CPM:{int(cpm/1000)}k | Freq:{freq} | CTR:{ctr}% | CR:{cr_mess}%]"
+                f"   • {sub['ten']}: {sub['chi_tieu']:,}đ | {sub['tin_nhan']} mess ({int(sub_gia/1000)}k) {icon_dg} [CPM:{int(cpm/1000)}k | Freq:{freq} | CTR:{ctr}% | CR:{cr_mess}%{vid_info}]"
             )
         lines.append("")
     lines.append("━━━━━━━━━━━━━━━━━━━━")
@@ -597,23 +753,26 @@ def gemini_danh_gia_chuyen_sau(tieu_de, du_lieu_text, chon_ai=None):
     YÊU CẦU BẮT BUỘC:
     - Trả lời CỰC KỲ NGẮN GỌN, SÚC TÍCH, ĐI THẲNG VÀO TRỌNG TÂM.
     - Chẩn đoán nguyên nhân dựa trên chỉ số:
-      + Do Nội dung (Content/Media): dựa vào CTR (cao >2% là thu hút, thấp <1.5% là nội dung/hình ảnh kém hấp dẫn).
+      + Do Nội dung (Content/Hình ảnh): dựa vào CTR (cao >2% là thu hút, thấp <1.5% là kém hấp dẫn).
+      + Do Video (nếu có chỉ số Hook/Hold):
+        * Hook Rate (3s đầu): >25% là tốt, <20% là 3 giây đầu nhàm chán, khách lướt qua ngay.
+        * Hold Rate (Giữ chân): >25% là cuốn hút, <15% là nội dung giữa video lan man, khách bỏ xem giữa chừng.
       + Do Tệp khách hàng (Audience): dựa vào CPM (đắt hay rẻ) và Tần suất lặp Freq (cao >2.2 là tệp hẹp/bão hòa).
       + Do Kịch bản chốt/Độ lệch phễu: dựa vào tỷ lệ chuyển đổi Click->Mess (CR%).
 
     Trình bày đúng 3 mục:
     🟢 1. VÌ SAO TỐT (MỤC HIỆU QUẢ):
     - [Tên mục tốt]: Giá mess bao nhiêu.
-    - Nguyên nhân: Chỉ rõ nhờ Nội dung (CTR cao...), Tệp khách (CPM...), hay Tỷ lệ chuyển đổi chat (CR%...).
+    - Nguyên nhân: Chỉ rõ nhờ Nội dung/Video (CTR, Hook, Hold...), Tệp khách (CPM...), hay Tỷ lệ chuyển đổi chat (CR%...).
 
     🔴 2. VÌ SAO CHƯA TỐT (MỤC ĐẮT / LỖ):
     - [Tên mục chưa tốt]: Giá mess bao nhiêu (hoặc tiêu bao nhiêu mà 0 mess).
-    - Nguyên nhân: Chỉ rõ lỗi tại [NỘI DUNG] (CTR thấp), tại [TỆP KHÁCH] (CPM cao/Freq cao), hay tại [KỊCH BẢN CHAT] (Click nhiều nhưng CR% thấp).
+    - Nguyên nhân: Chỉ rõ lỗi tại [3 GIÂY ĐẦU VIDEO] (Hook thấp), [NỘI DUNG GIỮA VIDEO] (Hold thấp), [HÌNH ẢNH/TIÊU ĐỀ] (CTR thấp), [TỆP KHÁCH] (CPM/Freq cao), hay [KỊCH BẢN CHAT] (CR% thấp).
 
     💡 3. ĐỀ XUẤT HÀNH ĐỘNG NGAY:
     - Tắt / Giảm vốn: Chỉ đích danh mục nào.
     - Tăng vốn: Chỉ đích danh mục nào.
-    - Cách khắc phục: Sửa nội dung 3s đầu, mở rộng tệp hay sửa kịch bản tin nhắn.
+    - Cách khắc phục cụ thể cho từng bài/nhóm.
 
     Không dùng ký tự dấu sao (*) hay dấu thăng (#).
     """
@@ -692,7 +851,8 @@ def hien_menu_chinh(cid, msg_id=None, tg_mac_dinh="today"):
             {"text": "📅 Báo Cáo Tất Cả (Hôm qua)", "callback_data": "QuickReport|yesterday"},
         ],
         [
-            {"text": "💰 Rà Soát Tổng Chi Tiêu (Tháng / Ngày Tùy Chỉnh)", "callback_data": "MENU_AUDIT"},
+            {"text": "💰 Rà Soát Ngân Sách (TK/Cụm/Nhóm)", "callback_data": "MENU_AUDIT"},
+            {"text": "💳 Kiểm Tra Công Nợ & Thẻ", "callback_data": "CHECK_BILLING"},
         ],
         [
             {"text": nhan_gemini, "callback_data": "SET_AI|gemini"},
@@ -712,7 +872,8 @@ def hien_menu_chinh(cid, msg_id=None, tg_mac_dinh="today"):
         f"🧠 AI mặc định đang chọn: {ten_ai_hien_tai}\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"🔍 Đã kết nối {len(BO_NHO_BM)} Tài khoản Quảng cáo.\n"
-        f"💡 Gõ trực tiếp ngày (VD: 15/10 hoặc 01/10 - 15/10) vào ô chat để rà soát chi tiêu ngày bất kỳ.\n\n"
+        f"🎬 Đã kích hoạt phân tích Video (Hook 3s & Hold Rate) + Kiểm toán Thuế VAT ({THUE_VAT_FB}%).\n"
+        f"💡 Gõ trực tiếp ngày (VD: 15/10 hoặc 01/10 - 15/10) vào ô chat để rà soát ngày bất kỳ.\n\n"
         f"👇 Chạm vào nút bên dưới để điều khiển:"
     )
     gui_hoac_sua_menu(cid, van_ban, nut_tk, msg_id)
@@ -748,6 +909,7 @@ def hien_man_hinh_tai_khoan(cid, tk_idx, tg="today", msg_id=None, can_tai_lai=Tr
     tong_tien = du_lieu_tk["tong_tien_tk"]
     tong_mess = du_lieu_tk["tong_mess_tk"]
     gia_tb = int(tong_tien / tong_mess) if tong_mess > 0 else 0
+    thue_tk = int(tong_tien * (THUE_VAT_FB / 100.0))
     luc_cap_nhat = du_lieu_tk.get("thoi_diem_cap_nhat", lay_gio_viet_nam().strftime("%H:%M:%S"))
 
     cum_list = du_lieu_tk.get("cum_list", [])
@@ -764,7 +926,7 @@ def hien_man_hinh_tai_khoan(cid, tk_idx, tg="today", msg_id=None, can_tai_lai=Tr
         f"📅 Kỳ dữ liệu: {ten_tg} (Cập nhật lúc: {luc_cap_nhat})\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"📌 Tổng: {du_lieu_tk['tong_so_camp']} camp | 🟢 Active: {du_lieu_tk['so_camp_active']} | 🔥 Có tiêu tiền: {du_lieu_tk['so_camp_co_tieu_tien']}\n"
-        f"💰 Tổng chi tiêu: {tong_tien:,}đ\n"
+        f"💰 Chi tiêu Ads: {tong_tien:,}đ (+Thuế {THUE_VAT_FB}%: {tong_tien + thue_tk:,}đ)\n"
         f"💬 Tổng tin nhắn: {tong_mess} mess (TB: {gia_tb:,}đ/mess)\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"📦 TỔNG HỢP THEO CỤM TÊN CAMP:\n{text_cum}\n"
@@ -824,7 +986,7 @@ def hien_man_hinh_camp(cid, tk_idx, c_idx, msg_id=None):
     gia_tb = int(c_info["chi_tieu"] / c_info["tin_nhan"]) if c_info["tin_nhan"] > 0 else 0
 
     bang_group = tao_bang_so_sanh_text(
-        f"CÁC GROUP TRONG CAMP [{c_info['ten']}]",
+        f"CÁC NHÓM (GROUP) TRONG CAMP [{c_info['ten']}]",
         groups_list,
         c_info["chi_tieu"],
     )
@@ -921,11 +1083,13 @@ def chay_bao_cao_tu_dong(khoang_tg="today", la_tu_dong_dinh_ky=False):
             )
             nhan_xet = gemini_danh_gia_chuyen_sau(f"{tk_info['ten']} ({ten_ky})", bang_cum)
             gia_tb = int(du_lieu["tong_tien_tk"] / du_lieu["tong_mess_tk"]) if du_lieu["tong_mess_tk"] > 0 else 0
+            thue_tk = int(du_lieu["tong_tien_tk"] * (THUE_VAT_FB / 100.0))
             mo_dau = (
                 f"{tieu_de_buoi}\n"
                 f"💳 Tài khoản: {tk_info['ten']}\n"
                 f"📌 Tổng: {du_lieu['tong_so_camp']} camp | 🟢 Active: {du_lieu['so_camp_active']} | 🔥 Có tiêu tiền: {du_lieu['so_camp_co_tieu_tien']}\n"
-                f"💰 Tổng tiêu: {du_lieu['tong_tien_tk']:,}đ | 💬 {du_lieu['tong_mess_tk']} mess (TB: {gia_tb:,}đ/mess)\n\n"
+                f"💰 Tổng tiêu: {du_lieu['tong_tien_tk']:,}đ (+Thuế {THUE_VAT_FB}%: {du_lieu['tong_tien_tk'] + thue_tk:,}đ)\n"
+                f"💬 Kết quả: {du_lieu['tong_mess_tk']} mess (TB: {gia_tb:,}đ/mess)\n\n"
             )
             gui_hoac_sua_menu(CHAT_ID, mo_dau + bang_cum + "\n\n" + nhan_xet)
 
@@ -983,20 +1147,25 @@ def chay_vong_lap_truc_chien_247(offset_ban_dau=0):
                     kq_ngay = phan_tich_ngay_tuy_chinh(text_raw)
                     if kq_ngay:
                         since_d, until_d, nhan_d = kq_ngay
-                        gui_hoac_sua_menu(cid, f"⏳ Đang rà soát tổng chi tiêu toàn bộ tài khoản [{nhan_d}]...")
-                        bc_audit = rà_soat_chi_tieu_bm(since_date=since_d, until_date=until_d, nhan_hien_thi=nhan_d)
-                        gui_hoac_sua_menu(
-                            cid,
-                            bc_audit,
-                            [
-                                [{"text": "💰 Chọn mốc Rà soát khác", "callback_data": "MENU_AUDIT"}],
-                                [{"text": "🏠 Về Bảng Điều Khiển Chính", "callback_data": "HOME"}],
-                            ],
-                        )
+                        gui_hoac_sua_menu(cid, f"⏳ Đang rà soát chi tiêu theo Tài khoản, Cụm & Nhóm [{nhan_d}]...")
+                        bc_audit, nut_audit = rà_soat_chi_tieu_bm(since_date=since_d, until_date=until_d, nhan_hien_thi=nhan_d)
+                        gui_hoac_sua_menu(cid, bc_audit, nut_audit)
                         continue
 
                     if text_in in ["/rasoat", "💰 rà soát chi tiêu (tháng/ngày)"]:
                         hien_menu_ra_soat(cid)
+
+                    elif text_in in ["/congno", "💳 kiểm tra công nợ & thẻ"]:
+                        gui_hoac_sua_menu(cid, "⏳ Đang kiểm tra công nợ, ngưỡng thanh toán và trạng thái thẻ...")
+                        bc_no = tao_bao_cao_cong_no_va_the()
+                        gui_hoac_sua_menu(
+                            cid,
+                            bc_no,
+                            [
+                                [{"text": "🔄 Làm mới Công nợ", "callback_data": "CHECK_BILLING"}],
+                                [{"text": "🏠 Về Bảng Điều Khiển Chính", "callback_data": "HOME"}],
+                            ],
+                        )
 
                     elif text_in in ["/homqua", "📅 báo cáo hôm qua"]:
                         gui_hoac_sua_menu(cid, "⏳ Đang tổng hợp báo cáo NGÀY HÔM QUA cho toàn bộ tài khoản...")
@@ -1011,6 +1180,7 @@ def chay_vong_lap_truc_chien_247(offset_ban_dau=0):
                     elif text_in in ["🔄 làm mới dữ liệu"]:
                         BO_NHO_BM.clear()
                         BO_NHO_TK.clear()
+                        BO_NHO_AUDIT.clear()
                         gui_ban_phim_co_dinh(cid, "✅ Đã làm mới bộ nhớ! Đang tải lại số liệu Realtime...")
                         hien_menu_chinh(cid, tg_mac_dinh="today")
 
@@ -1049,6 +1219,19 @@ def chay_vong_lap_truc_chien_247(offset_ban_dau=0):
                     if lenh == "HOME":
                         hien_menu_chinh(cid, msg_id, tg_mac_dinh="today")
 
+                    elif lenh == "CHECK_BILLING":
+                        gui_hoac_sua_menu(cid, "⏳ Đang kiểm tra công nợ, ngưỡng thanh toán và trạng thái thẻ...", None, msg_id)
+                        bc_no = tao_bao_cao_cong_no_va_the()
+                        gui_hoac_sua_menu(
+                            cid,
+                            bc_no,
+                            [
+                                [{"text": "🔄 Làm mới Công nợ", "callback_data": "CHECK_BILLING"}],
+                                [{"text": "🏠 Về Bảng Điều Khiển Chính", "callback_data": "HOME"}],
+                            ],
+                            msg_id,
+                        )
+
                     elif lenh == "MENU_AUDIT":
                         hien_menu_ra_soat(cid, msg_id)
 
@@ -1057,16 +1240,41 @@ def chay_vong_lap_truc_chien_247(offset_ban_dau=0):
                         ten_ky_audit = NHAN_THOI_GIAN.get(che_do_audit, che_do_audit)
                         gui_hoac_sua_menu(
                             cid,
-                            f"⏳ Đang rà soát tổng chi tiêu toàn bộ tài khoản [{ten_ky_audit}]...",
+                            f"⏳ Đang rà soát ngân sách theo Tài khoản, Cụm & Nhóm [{ten_ky_audit}]...",
                             None,
                             msg_id,
                         )
-                        bc_audit = rà_soat_chi_tieu_bm(che_do=che_do_audit, nhan_hien_thi=ten_ky_audit)
+                        bc_audit, nut_audit = rà_soat_chi_tieu_bm(che_do=che_do_audit, nhan_hien_thi=ten_ky_audit)
+                        gui_hoac_sua_menu(cid, bc_audit, nut_audit, msg_id)
+
+                    elif lenh == "AUDIT_TK":
+                        tk_idx = parts[1]
+                        van_ban_nhom, nut_nhom = tao_bang_chi_tiet_nhom_audit(tk_idx)
+                        gui_hoac_sua_menu(cid, van_ban_nhom, nut_nhom, msg_id)
+
+                    elif lenh == "AI_AUDIT":
+                        tk_idx = parts[1]
+                        chon_ai = parts[2] if len(parts) > 2 else None
+                        if tk_idx not in BO_NHO_AUDIT:
+                            hien_menu_ra_soat(cid, msg_id)
+                            continue
+                        van_ban_nhom, _ = tao_bang_chi_tiet_nhom_audit(tk_idx)
+                        ten_ai_chay = "ChatGPT" if (chon_ai or AI_UU_TIEN) == "chatgpt" else "Gemini"
+                        gui_hoac_sua_menu(cid, van_ban_nhom + f"\n\n⏳ {ten_ai_chay} đang phân tích chi tiết các Nhóm trong kỳ rà soát...", None, msg_id)
+                        nhan_xet = gemini_danh_gia_chuyen_sau(
+                            f"Rà soát Nhóm ({BO_NHO_AUDIT[tk_idx]['ten_tk']} - {BO_NHO_AUDIT[tk_idx]['nhan_hien_thi']})",
+                            van_ban_nhom,
+                            chon_ai=chon_ai,
+                        )
                         gui_hoac_sua_menu(
                             cid,
-                            bc_audit,
+                            van_ban_nhom + "\n\n" + nhan_xet,
                             [
-                                [{"text": "💰 Chọn mốc Rà soát khác", "callback_data": "MENU_AUDIT"}],
+                                [
+                                    {"text": "✨ Soi lại bằng Gemini", "callback_data": f"AI_AUDIT|{tk_idx}|gemini"},
+                                    {"text": "🤖 Soi lại bằng ChatGPT", "callback_data": f"AI_AUDIT|{tk_idx}|chatgpt"},
+                                ],
+                                [{"text": "⬅️ Quay lại Menu Rà Soát", "callback_data": "MENU_AUDIT"}],
                                 [{"text": "🏠 Về Bảng Điều Khiển Chính", "callback_data": "HOME"}],
                             ],
                             msg_id,
@@ -1260,12 +1468,17 @@ def chay_vong_lap_truc_chien_247(offset_ban_dau=0):
                         c_info = BO_NHO_TK[tk_idx]["data"]["camps_list"][int(c_idx)]
                         g_info = c_info["groups_list"][int(g_idx)]
                         a_info = g_info["ads_list"][int(a_idx)]
+                        dong_vid_ad = (
+                            f"\n• 🎬 Video: Hook (3s) {a_info['hook_rate']}% ({a_info['video_3s']} lượt) | Hold (ThruPlay) {a_info['hold_rate']}% ({a_info['thruplay']} lượt)"
+                            if a_info.get("hook_rate", 0) > 0
+                            else ""
+                        )
                         chi_tiet_ad = (
                             f"📝 BÀI ADS: {a_info['ten']}\n"
                             f"• Thuộc Camp: {c_info['ten']} | Group: {g_info['ten']}\n"
                             f"• Chi tiêu: {a_info['chi_tieu']:,}đ | KQ: {a_info['tin_nhan']} mess ({a_info['gia_mess']:,}đ/mess) | {a_info['binh_luan']} cmt\n"
                             f"• Tệp khách: CPM {a_info['cpm']:,}đ | Lặp (Freq) {a_info['frequency']} | Reach {a_info['reach']:,}\n"
-                            f"• Nội dung & Phễu: CTR {a_info['ctr']}% | CPC {a_info['cpc']:,}đ | Click->Mess {a_info['cr_click_to_mess']}%"
+                            f"• Nội dung & Phễu: CTR {a_info['ctr']}% | CPC {a_info['cpc']:,}đ | Click->Mess {a_info['cr_click_to_mess']}%{dong_vid_ad}"
                         )
                         ten_ai_chay = "ChatGPT" if (chon_ai or AI_UU_TIEN) == "chatgpt" else "Gemini"
                         gui_hoac_sua_menu(cid, chi_tiet_ad + f"\n\n⏳ {ten_ai_chay} đang bắt bệnh riêng cho Bài Ads này...", None, msg_id)
