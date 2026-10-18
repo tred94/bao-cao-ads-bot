@@ -10,7 +10,7 @@ from datetime import datetime, timezone, timedelta
 KPI_MESS = int(os.environ.get("KPI_GIA_MESS", "60000"))       # Mốc KPI giá mỗi tin nhắn (VNĐ)
 GIO_BAO_CAO_SANG = 8                                          # 8h sáng -> Tự báo số liệu HÔM QUA (yesterday)
 GIO_BAO_CAO_TOI = 20                                          # 20h tối -> Tự báo số liệu HÔM NAY (today)
-THOI_GIAN_ DUY_TRI_PHIEN = 54 * 60                            # Giữ Bot thức liên tục 54 phút (nối tiếp mỗi giờ = 24/24)
+THOI_GIAN_DUY_TRI_PHIEN = 54 * 60                            # Giữ Bot thức liên tục 54 phút (nối tiếp mỗi giờ = 24/24)
 
 # Tự động lấy mã bảo mật từ GitHub Secrets
 FB_TOKEN = os.environ.get("FB_ACCESS_TOKEN", "").strip()
