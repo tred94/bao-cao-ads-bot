@@ -421,7 +421,9 @@ def gemini_danh_gia_chuyen_sau(tieu_de, du_lieu_text):
                     timeout=20,
                 ).json()
                 if "candidates" in r:
-                    return r["candidates"][0]["content"]["parts"][0]["text"]
+                    ten_model = m.replace("models/", "")
+                    noi_dung = r["candidates"][0]["content"]["parts"][0]["text"]
+                    return f"✨ [Phân tích bởi Gemini ({ten_model})]\n\n{noi_dung}"
             except Exception:
                 continue
 
@@ -429,7 +431,7 @@ def gemini_danh_gia_chuyen_sau(tieu_de, du_lieu_text):
     if OPENAI_KEY:
         kq_gpt = goi_openai_gpt(prompt)
         if kq_gpt:
-            return f"🤖 [Phân tích bởi ChatGPT]\n\n{kq_gpt}"
+            return f"🤖 [Phân tích bởi ChatGPT (gpt-4o-mini)]\n\n{kq_gpt}"
 
     return "⚠️ Không kết nối được cả Gemini API và OpenAI API."
 
