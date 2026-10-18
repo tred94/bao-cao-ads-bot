@@ -1,5 +1,6 @@
 import os
 import re
+import json
 import time
 import requests
 from datetime import datetime, timezone, timedelta
@@ -33,13 +34,17 @@ NHAN_THOI_GIAN = {
     "yesterday": "Hôm qua",
     "last_3d": "3 ngày qua",
     "last_7d": "7 ngày qua",
+    "this_month": "Tháng này",
+    "last_month": "Tháng trước",
+    "last_30d": "30 ngày qua",
 }
 
 # Bàn phím nút bấm cố định luôn nằm ở dưới đáy màn hình Telegram
 BAN_PHIM_CO_DINH = {
     "keyboard": [
         [{"text": "🎛 Mở Bảng Điều Khiển"}, {"text": "⚡ Báo Cáo Realtime (Hôm nay)"}],
-        [{"text": "📅 Báo Cáo Hôm Qua"}, {"text": "🔄 Làm Mới Dữ Liệu"}],
+        [{"text": "📅 Báo Cáo Hôm Qua"}, {"text": "💰 Rà Soát Chi Tiêu (Tháng/Ngày)"}],
+        [{"text": "🔄 Làm Mới Dữ Liệu"}],
     ],
     "resize_keyboard": True,
     "is_persistent": True,
@@ -54,6 +59,7 @@ def cai_dat_menu_lenh_telegram():
     url = f"https://api.telegram.org/bot{TELE_TOKEN}/setMyCommands"
     commands = [
         {"command": "menu", "description": "🎛 Mở Bảng điều khiển (Check Realtime)"},
+        {"command": "rasoat", "description": "💰 Rà soát tổng chi tiêu Tháng / Ngày tùy chỉnh"},
         {"command": "homnay", "description": "⚡ Xuất báo cáo Realtime Hôm nay"},
         {"command": "homqua", "description": "📅 Xuất báo cáo tổng kết Hôm qua"},
     ]
@@ -117,8 +123,58 @@ def gom_cum_chien_dich(ds_camps_list):
     return ds_cum_sorted
 
 
+def phan_tich_ngay_tuy_chinh(text_in):
+    """Nhận diện chuỗi ngày: '15/10', '15/10/2026', hoặc '01/10 - 15/10'"""
+    now_vn = lay_gio_viet_nam()
+    nam_ht = now_vn.year
+
+    s = re.sub(r"^(/ngay|/rasoat|ngay|ngày)\s*", "", text_in.strip(), flags=re.IGNORECASE).strip()
+
+    # Trường hợp khoảng ngày: DD/MM(/YYYY) - DD/MM(/YYYY)
+    m_range = re.match(
+        r"^(\d{1,2})[\/\-](\d{1,2})(?:[\/\-](\d{2,4}))?\s*(?:đến|den|to|\-|\~)\s*(\d{1,2})[\/\-](\d{1,2})(?:[\/\-](\d{2,4}))?$",
+        s,
+    )
+    if m_range:
+        d1, m1, y1, d2, m2, y2 = m_range.groups()
+        y1 = int(y1) if y1 else nam_ht
+        y2 = int(y2) if y2 else nam_ht
+        if y1 < 100:
+            y1 += 2000
+        if y2 < 100:
+            y2 += 2000
+        try:
+            dt1 = datetime(y1, int(m1), int(d1))
+            dt2 = datetime(y2, int(m2), int(d2))
+            if dt1 > dt2:
+                dt1, dt2 = dt2, dt1
+            return (
+                dt1.strftime("%Y-%m-%d"),
+                dt2.strftime("%Y-%m-%d"),
+                f"Từ {dt1.strftime('%d/%m/%Y')} đến {dt2.strftime('%d/%m/%Y')}",
+            )
+        except ValueError:
+            return None
+
+    # Trường hợp 1 ngày duy nhất: DD/MM(/YYYY)
+    m_single = re.match(r"^(\d{1,2})[\/\-](\d{1,2})(?:[\/\-](\d{2,4}))?$", s)
+    if m_single:
+        d1, m1, y1 = m_single.groups()
+        y1 = int(y1) if y1 else nam_ht
+        if y1 < 100:
+            y1 += 2000
+        try:
+            dt1 = datetime(y1, int(m1), int(d1))
+            ymd = dt1.strftime("%Y-%m-%d")
+            return ymd, ymd, f"Ngày {dt1.strftime('%d/%m/%Y')}"
+        except ValueError:
+            return None
+
+    return None
+
+
 # ==============================================================================
-# 2. QUÉT DỮ LIỆU FACEBOOK 5 TẦNG (MẶC ĐỊNH REALTIME = TODAY)
+# 2. QUÉT DỮ LIỆU FACEBOOK 5 TẦNG & RÀ SOÁT TỔNG CHI TIÊU
 # ==============================================================================
 def trich_xuat_ket_qua(actions_list):
     mess, cmt, lead = 0, 0, 0
@@ -162,6 +218,133 @@ def quet_danh_sach_tai_khoan():
             "icon": icon_map.get(st_code, "⚪"),
         }
     return ds_tk
+
+
+def rà_soat_chi_tieu_bm(che_do="this_month", since_date=None, until_date=None, nhan_hien_thi=""):
+    """Quét nhanh tổng chi tiêu, tin nhắn, bình luận của toàn bộ tài khoản theo Tháng hoặc Ngày tùy chỉnh"""
+    global BO_NHO_BM
+    if not BO_NHO_BM:
+        BO_NHO_BM = quet_danh_sach_tai_khoan()
+
+    tong_chi_bm = 0
+    tong_mess_bm = 0
+    tong_cmt_bm = 0
+    ds_ket_qua = []
+
+    for tk_idx, tk_info in BO_NHO_BM.items():
+        url_ins = f"https://graph.facebook.com/v21.0/{tk_info['id']}/insights"
+        params = {
+            "level": "account",
+            "fields": "spend,impressions,reach,clicks,ctr,cpm,actions",
+            "access_token": FB_TOKEN,
+        }
+        if since_date and until_date:
+            params["time_range"] = json.dumps({"since": since_date, "until": until_date})
+        else:
+            params["date_preset"] = che_do
+
+        try:
+            r = requests.get(url_ins, params=params, timeout=15).json()
+            data = r.get("data", [])
+            if data:
+                row = data[0]
+                spend = int(float(row.get("spend", 0)))
+                mess, cmt, _ = trich_xuat_ket_qua(row.get("actions", []))
+                clicks = int(float(row.get("clicks", 0)))
+                impr = int(float(row.get("impressions", 0)))
+            else:
+                spend, mess, cmt, clicks, impr = 0, 0, 0, 0, 0
+        except Exception:
+            spend, mess, cmt, clicks, impr = 0, 0, 0, 0, 0
+
+        tong_chi_bm += spend
+        tong_mess_bm += mess
+        tong_cmt_bm += cmt
+
+        ds_ket_qua.append({
+            "tk_idx": tk_idx,
+            "ten": tk_info["ten"],
+            "icon": tk_info["icon"],
+            "spend": spend,
+            "mess": mess,
+            "cmt": cmt,
+            "clicks": clicks,
+            "impr": impr,
+        })
+
+    ds_ket_qua.sort(key=lambda x: x["spend"], reverse=True)
+    gia_tb_bm = int(tong_chi_bm / tong_mess_bm) if tong_mess_bm > 0 else 0
+
+    lines = [
+        f"💰 BẢNG RÀ SOÁT TỔNG CHI TIÊU TÀI KHOẢN",
+        f"📅 Kỳ rà soát: {nhan_hien_thi}",
+        f"🕒 Cập nhật: {lay_gio_viet_nam().strftime('%H:%M:%S - %d/%m/%Y')}",
+        "━━━━━━━━━━━━━━━━━━━━",
+        f"🔥 TỔNG CHI TIÊU TOÀN BM: {tong_chi_bm:,}đ",
+        f"💬 Tổng tin nhắn: {tong_mess_bm:,} mess (TB: {gia_tb_bm:,}đ/mess)",
+        f"💭 Tổng bình luận: {tong_cmt_bm:,} cmt",
+        "━━━━━━━━━━━━━━━━━━━━",
+        "📋 CHI TIẾT TỪNG TÀI KHOẢN:",
+    ]
+
+    co_tk_tieu = False
+    for idx, item in enumerate(ds_ket_qua, 1):
+        if item["spend"] > 0:
+            co_tk_tieu = True
+            gia_m = int(item["spend"] / item["mess"]) if item["mess"] > 0 else 0
+            ty_trong = round((item["spend"] / tong_chi_bm) * 100, 1) if tong_chi_bm > 0 else 0
+            lines.append(
+                f"{idx}. {item['icon']} {item['ten']}\n"
+                f"   • Chi tiêu: {item['spend']:,}đ ({ty_trong}%)\n"
+                f"   • Kết quả: {item['mess']} mess ({gia_m:,}đ/mess) | {item['cmt']} cmt"
+            )
+        else:
+            lines.append(f"{idx}. {item['icon']} {item['ten']}: 0đ (Không chi tiêu)")
+
+    if not co_tk_tieu:
+        lines.append("\nℹ️ Không có tài khoản nào phát sinh chi tiêu trong khoảng thời gian này.")
+
+    lines.append("━━━━━━━━━━━━━━━━━━━━")
+    lines.append(
+        "💡 MẸO TRA CỨU NGÀY TÙY CHỈNH:\n"
+        "Bạn có thể gõ trực tiếp ngày vào ô chat bất cứ lúc nào theo cú pháp:\n"
+        "• Xem 1 ngày: 15/10 hoặc 15/10/2026\n"
+        "• Xem khoảng ngày: 01/10 - 15/10"
+    )
+    return "\n".join(lines)
+
+
+def hien_menu_ra_soat(cid, msg_id=None):
+    now_vn = lay_gio_viet_nam()
+    thang_nay_str = now_vn.strftime("%m/%Y")
+    thang_truoc_dt = now_vn.replace(day=1) - timedelta(days=1)
+    thang_truoc_str = thang_truoc_dt.strftime("%m/%Y")
+
+    van_ban = (
+        f"💰 TRUNG TÂM RÀ SOÁT TỔNG CHI TIÊU\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"Chọn nhanh mốc thời gian bên dưới để tổng hợp chi tiêu của toàn bộ Tài khoản Quảng cáo:\n\n"
+        f"✍️ HOẶC GÕ TRỰC TIẾP NGÀY TÙY CHỈNH VÀO Ô CHAT:\n"
+        f"• Gõ 1 ngày: 15/10 hoặc 15/10/2026\n"
+        f"• Gõ nhiều ngày: 01/10 - 15/10\n"
+    )
+
+    nut_bam = [
+        [
+            {"text": f"📆 Tháng này ({thang_nay_str})", "callback_data": "AUDIT|this_month"},
+            {"text": f"⏪ Tháng trước ({thang_truoc_str})", "callback_data": "AUDIT|last_month"},
+        ],
+        [
+            {"text": "🗓 30 ngày qua", "callback_data": "AUDIT|last_30d"},
+            {"text": "🗓 7 ngày qua", "callback_data": "AUDIT|last_7d"},
+        ],
+        [
+            {"text": "⚡ Hôm nay", "callback_data": "AUDIT|today"},
+            {"text": "📅 Hôm qua", "callback_data": "AUDIT|yesterday"},
+        ],
+        [{"text": "⬅️ Quay lại Bảng Điều Khiển Chính", "callback_data": "HOME"}],
+    ]
+    gui_hoac_sua_menu(cid, van_ban, nut_bam, msg_id)
 
 
 def tai_du_lieu_5_tang(ma_tk, khoang_tg="today"):
@@ -509,6 +692,9 @@ def hien_menu_chinh(cid, msg_id=None, tg_mac_dinh="today"):
             {"text": "📅 Báo Cáo Tất Cả (Hôm qua)", "callback_data": "QuickReport|yesterday"},
         ],
         [
+            {"text": "💰 Rà Soát Tổng Chi Tiêu (Tháng / Ngày Tùy Chỉnh)", "callback_data": "MENU_AUDIT"},
+        ],
+        [
             {"text": nhan_gemini, "callback_data": "SET_AI|gemini"},
             {"text": nhan_gpt, "callback_data": "SET_AI|chatgpt"},
         ],
@@ -526,8 +712,8 @@ def hien_menu_chinh(cid, msg_id=None, tg_mac_dinh="today"):
         f"🧠 AI mặc định đang chọn: {ten_ai_hien_tai}\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"🔍 Đã kết nối {len(BO_NHO_BM)} Tài khoản Quảng cáo.\n"
-        f"⚡ Mặc định khi bấm vào tài khoản sẽ lấy số liệu REALTIME HÔM NAY (từ 0h00 đến hiện tại).\n\n"
-        f"👇 Chạm vào nút bên dưới để đổi AI hoặc kiểm tra tài khoản:"
+        f"💡 Gõ trực tiếp ngày (VD: 15/10 hoặc 01/10 - 15/10) vào ô chat để rà soát chi tiêu ngày bất kỳ.\n\n"
+        f"👇 Chạm vào nút bên dưới để điều khiển:"
     )
     gui_hoac_sua_menu(cid, van_ban, nut_tk, msg_id)
 
@@ -543,7 +729,7 @@ def hien_man_hinh_tai_khoan(cid, tk_idx, tg="today", msg_id=None, can_tai_lai=Tr
     if can_tai_lai or tk_idx not in BO_NHO_TK:
         gui_hoac_sua_menu(
             cid,
-            f"⏳ Đang quét dữ liệu Realtime [{tk_info['ten']}]\n📅 Kỳ dữ liệu: {ten_tg}...",
+            f"⏳ Đang quét dữ liệu [{tk_info['ten']}]\n📅 Kỳ dữ liệu: {ten_tg}...",
             None,
             msg_id,
         )
@@ -583,21 +769,25 @@ def hien_man_hinh_tai_khoan(cid, tk_idx, tg="today", msg_id=None, can_tai_lai=Tr
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"📦 TỔNG HỢP THEO CỤM TÊN CAMP:\n{text_cum}\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"👇 Đổi kỳ dữ liệu, chọn AI Đánh giá hoặc bấm vào từng Camp bên dưới:"
+        f"👇 Đổi kỳ dữ liệu (Ngày/Tháng), chọn AI Đánh giá hoặc bấm vào từng Camp bên dưới:"
     )
 
-    cac_moc = [("today", "⚡ Hôm nay"), ("yesterday", "Hôm qua"), ("last_3d", "3 ngày"), ("last_7d", "7 ngày")]
-    hang_thoi_gian = []
-    for ma_tg, nhan_ngan in cac_moc:
+    cac_moc_1 = [("today", "⚡ Hôm nay"), ("yesterday", "Hôm qua"), ("last_3d", "3 ngày"), ("last_7d", "7 ngày")]
+    hang_tg_1 = []
+    for ma_tg, nhan_ngan in cac_moc_1:
         hien_thi = f"✅ {nhan_ngan}" if tg == ma_tg else nhan_ngan
-        hang_thoi_gian.append({
-            "text": hien_thi,
-            "callback_data": f"TK|{tk_idx}|{ma_tg}",
-        })
-    nut_camp = [hang_thoi_gian]
+        hang_tg_1.append({"text": hien_thi, "callback_data": f"TK|{tk_idx}|{ma_tg}"})
+
+    cac_moc_2 = [("this_month", "📆 Tháng này"), ("last_month", "⏪ Tháng trước")]
+    hang_tg_2 = []
+    for ma_tg, nhan_ngan in cac_moc_2:
+        hien_thi = f"✅ {nhan_ngan}" if tg == ma_tg else nhan_ngan
+        hang_tg_2.append({"text": hien_thi, "callback_data": f"TK|{tk_idx}|{ma_tg}"})
+
+    nut_camp = [hang_tg_1, hang_tg_2]
 
     nut_camp.append([{
-        "text": f"🔄 Làm mới số liệu Realtime ({lay_gio_viet_nam().strftime('%H:%M')})",
+        "text": f"🔄 Làm mới số liệu ({lay_gio_viet_nam().strftime('%H:%M')})",
         "callback_data": f"TK|{tk_idx}|{tg}",
     }])
 
@@ -786,9 +976,29 @@ def chay_vong_lap_truc_chien_247(offset_ban_dau=0):
                     if str(cid) != str(CHAT_ID):
                         continue
 
-                    text_in = update["message"]["text"].strip().lower()
+                    text_raw = update["message"]["text"].strip()
+                    text_in = text_raw.lower()
 
-                    if text_in in ["/homqua", "📅 báo cáo hôm qua"]:
+                    # Kiểm tra nếu người dùng gõ ngày tùy chỉnh (VD: 15/10 hoặc 01/10 - 15/10)
+                    kq_ngay = phan_tich_ngay_tuy_chinh(text_raw)
+                    if kq_ngay:
+                        since_d, until_d, nhan_d = kq_ngay
+                        gui_hoac_sua_menu(cid, f"⏳ Đang rà soát tổng chi tiêu toàn bộ tài khoản [{nhan_d}]...")
+                        bc_audit = rà_soat_chi_tieu_bm(since_date=since_d, until_date=until_d, nhan_hien_thi=nhan_d)
+                        gui_hoac_sua_menu(
+                            cid,
+                            bc_audit,
+                            [
+                                [{"text": "💰 Chọn mốc Rà soát khác", "callback_data": "MENU_AUDIT"}],
+                                [{"text": "🏠 Về Bảng Điều Khiển Chính", "callback_data": "HOME"}],
+                            ],
+                        )
+                        continue
+
+                    if text_in in ["/rasoat", "💰 rà soát chi tiêu (tháng/ngày)"]:
+                        hien_menu_ra_soat(cid)
+
+                    elif text_in in ["/homqua", "📅 báo cáo hôm qua"]:
                         gui_hoac_sua_menu(cid, "⏳ Đang tổng hợp báo cáo NGÀY HÔM QUA cho toàn bộ tài khoản...")
                         chay_bao_cao_tu_dong("yesterday", la_tu_dong_dinh_ky=False)
                         hien_menu_chinh(cid, tg_mac_dinh="today")
@@ -838,6 +1048,29 @@ def chay_vong_lap_truc_chien_247(offset_ban_dau=0):
 
                     if lenh == "HOME":
                         hien_menu_chinh(cid, msg_id, tg_mac_dinh="today")
+
+                    elif lenh == "MENU_AUDIT":
+                        hien_menu_ra_soat(cid, msg_id)
+
+                    elif lenh == "AUDIT":
+                        che_do_audit = parts[1]
+                        ten_ky_audit = NHAN_THOI_GIAN.get(che_do_audit, che_do_audit)
+                        gui_hoac_sua_menu(
+                            cid,
+                            f"⏳ Đang rà soát tổng chi tiêu toàn bộ tài khoản [{ten_ky_audit}]...",
+                            None,
+                            msg_id,
+                        )
+                        bc_audit = rà_soat_chi_tieu_bm(che_do=che_do_audit, nhan_hien_thi=ten_ky_audit)
+                        gui_hoac_sua_menu(
+                            cid,
+                            bc_audit,
+                            [
+                                [{"text": "💰 Chọn mốc Rà soát khác", "callback_data": "MENU_AUDIT"}],
+                                [{"text": "🏠 Về Bảng Điều Khiển Chính", "callback_data": "HOME"}],
+                            ],
+                            msg_id,
+                        )
 
                     elif lenh == "QuickReport":
                         ky_bc = parts[1]
