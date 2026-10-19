@@ -1190,7 +1190,7 @@ def hien_man_hinh_group(cid, tk_idx, c_idx, g_idx, msg_id=None):
 
 
 # ==============================================================================
-# 5. HÀM BÁO CÁO TỔNG (4 TK) & ĐỊNH KỲ 8H SÁNG / 20H TỐI
+# 5. HÀM BÁO CÁO TỔNG (4 TK) & CHỐNG TRÙNG LẶP XUYÊN PHIÊN 8H SÁNG / 20H TỐI
 # ==============================================================================
 def chay_bao_cao_tu_dong(khoang_tg="today", la_tu_dong_dinh_ky=False, since_date=None, until_date=None, nhan_tuy_chinh=None):
     global BO_NHO_BM
@@ -1255,19 +1255,49 @@ def chay_bao_cao_tu_dong(khoang_tg="today", la_tu_dong_dinh_ky=False, since_date
         )
 
 
+def da_bao_cao_xuyen_phien(ma_ngay_gio):
+    """Kiểm tra trực tiếp trên Telegram xem khung giờ này đã gửi báo cáo chưa (Chống gửi lặp 2 lần)"""
+    if ma_ngay_gio in DA_BAO_CAO_TRONG_PHIEN:
+        return True
+    try:
+        r = requests.get(f"https://api.telegram.org/bot{TELE_TOKEN}/getMyShortDescription", timeout=5).json()
+        mo_ta_hien_tai = r.get("result", {}).get("short_description", "")
+        if f"[DONE:{ma_ngay_gio}]" in mo_ta_hien_tai:
+            DA_BAO_CAO_TRONG_PHIEN.add(ma_ngay_gio)
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def danh_dau_da_bao_cao_xuyen_phien(ma_ngay_gio):
+    """Ghi dấu mốc đã báo cáo lên Telegram để phiên sau khởi động lại không gửi trùng nữa"""
+    DA_BAO_CAO_TRONG_PHIEN.add(ma_ngay_gio)
+    try:
+        requests.post(
+            f"https://api.telegram.org/bot{TELE_TOKEN}/setMyShortDescription",
+            json={"short_description": f"Trợ lý Kiểm toán Ads 24/7 [DONE:{ma_ngay_gio}]"},
+            timeout=5,
+        )
+    except Exception:
+        pass
+
+
 def kiem_tra_den_gio_bao_cao_tu_dong():
     now_vn = lay_gio_viet_nam()
     ma_ngay_gio = now_vn.strftime("%Y-%m-%d_%H")
 
-    if now_vn.hour == GIO_BAO_CAO_SANG and now_vn.minute <= 15 and ma_ngay_gio not in DA_BAO_CAO_TRONG_PHIEN:
-        DA_BAO_CAO_TRONG_PHIEN.add(ma_ngay_gio)
-        chay_bao_cao_tu_dong("yesterday", la_tu_dong_dinh_ky=True)
-        hien_luong_1_ds_tai_khoan(CHAT_ID, tg_mac_dinh="today")
+    if now_vn.hour == GIO_BAO_CAO_SANG and now_vn.minute <= 15:
+        if not da_bao_cao_xuyen_phien(ma_ngay_gio):
+            danh_dau_da_bao_cao_xuyen_phien(ma_ngay_gio)
+            chay_bao_cao_tu_dong("yesterday", la_tu_dong_dinh_ky=True)
+            hien_luong_1_ds_tai_khoan(CHAT_ID, tg_mac_dinh="today")
 
-    elif now_vn.hour == GIO_BAO_CAO_TOI and now_vn.minute <= 15 and ma_ngay_gio not in DA_BAO_CAO_TRONG_PHIEN:
-        DA_BAO_CAO_TRONG_PHIEN.add(ma_ngay_gio)
-        chay_bao_cao_tu_dong("today", la_tu_dong_dinh_ky=True)
-        hien_luong_1_ds_tai_khoan(CHAT_ID, tg_mac_dinh="today")
+    elif now_vn.hour == GIO_BAO_CAO_TOI and now_vn.minute <= 15:
+        if not da_bao_cao_xuyen_phien(ma_ngay_gio):
+            danh_dau_da_bao_cao_xuyen_phien(ma_ngay_gio)
+            chay_bao_cao_tu_dong("today", la_tu_dong_dinh_ky=True)
+            hien_luong_1_ds_tai_khoan(CHAT_ID, tg_mac_dinh="today")
 
 
 # ==============================================================================
