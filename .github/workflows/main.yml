@@ -1,14 +1,18 @@
 name: Chay Bot Ads 24/7
 
 on:
+  push:
+    branches: [ main ]
   repository_dispatch:
-    types: [thuc_day_bot]
+    types: [ thuc_day_bot ]
   workflow_dispatch:
     inputs:
       che_do:
         description: 'Chế độ chạy (menu / today / yesterday)'
         required: false
         default: 'menu'
+  schedule:
+    - cron: '0 * * * *'
 
 concurrency:
   group: bot-running-group
@@ -27,8 +31,7 @@ jobs:
           python-version: '3.10'
 
       - name: Cài đặt thư viện
-        run: |
-          pip install requests
+        run: pip install requests
 
       - name: Khởi chạy Bot
         env:
@@ -39,6 +42,7 @@ jobs:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           SHEET_WEBHOOK_URL: ${{ secrets.SHEET_WEBHOOK_URL }}
           KPI_GIA_MESS: "60000"
+          THUE_VAT_FB: "10.0"
           EVENT_NAME: ${{ github.event_name }}
           CHE_DO_INPUT: ${{ github.event.inputs.che_do }}
         run: python bot.py
