@@ -178,11 +178,7 @@ def gui_batch_len_google_sheet(ds_items):
 
 def dong_bo_khoang_ngay_len_sheet(since_ymd, until_ymd):
     """
-    Quét tách lẻ từng ngày (time_increment=1) từ since_ymd -> until_ymd
-    trên tất cả các tài khoản, gom vào:
-      - Tab 'Tổng' (Tổng chi tiêu tất cả tài khoản theo từng ngày)
-      - Các Tab Cụm riêng biệt (VD: 'H', 'TRUST'...) theo đúng tên Cụm
-    rồi điền thẳng vào bảng Tháng nằm ngang trên Google Sheet.
+    Quét và đẩy dữ liệu lên Google Sheet theo từng ngày một để tránh lỗi timeout (read timed out).
     """
     global BO_NHO_BM
     if not SHEET_WEBHOOK_URL:
@@ -191,86 +187,98 @@ def dong_bo_khoang_ngay_len_sheet(since_ymd, until_ymd):
     if not BO_NHO_BM:
         BO_NHO_BM = quet_danh_sach_tai_khoan()
 
-    tong_theo_ngay = {}      # { "2026-10-19": {"spend": 0, "mess": 0, "cmt": 0} }
-    cum_theo_ngay = {}       # { ("H", "2026-10-19"): {"spend": 0, "mess": 0, "cmt": 0} }
+    dt_start = datetime.strptime(since_ymd, "%Y-%m-%d")
+    dt_end = datetime.strptime(until_ymd, "%Y-%m-%d")
+    
+    ngay_hien_tai = dt_start
+    tong_so_ngay_thanh_cong = 0
+    danh_sach_tab_da_dien = set()
 
-    for tk_idx, tk_info in BO_NHO_BM.items():
-        url_ins = f"https://graph.facebook.com/v21.0/{tk_info['id']}/insights"
-        params = {
-            "level": "campaign",
-            "time_increment": 1,
-            "time_range": json.dumps({"since": since_ymd, "until": until_ymd}),
-            "fields": "campaign_name,spend,actions,date_start",
-            "limit": 1000,
-            "access_token": FB_TOKEN,
-        }
-        try:
-            r_ins = requests.get(url_ins, params=params, timeout=25).json()
-        except Exception:
-            continue
+    # Vòng lặp chạy từng ngày một để không bao giờ bị quá tải mạng
+    while ngay_hien_tai <= dt_end:
+        ngay_ymd = ngay_hien_tai.strftime("%Y-%m-%d")
+        ngay_hien_tai += timedelta(days=1)
 
-        for row in r_ins.get("data", []):
-            spend = int(float(row.get("spend", 0)))
-            if spend <= 0:
+        tong_theo_ngay = {}
+        cum_theo_ngay = {}
+
+        for tk_idx, tk_info in BO_NHO_BM.items():
+            url_ins = f"https://graph.facebook.com/v21.0/{tk_info['id']}/insights"
+            params = {
+                "level": "campaign",
+                "time_range": json.dumps({"since": ngay_ymd, "until": ngay_ymd}),
+                "fields": "campaign_name,spend,actions,date_start",
+                "limit": 500,
+                "access_token": FB_TOKEN,
+            }
+            try:
+                r_ins = requests.get(url_ins, params=params, timeout=15).json()
+            except Exception:
                 continue
-            ngay = row.get("date_start")
-            c_name = row.get("campaign_name", "Khác")
-            ten_cum = tach_ten_cum(c_name)
-            mess, cmt, _, _, _ = trich_xuat_ket_qua(row.get("actions", []))
 
-            # 1. Cộng dồn vào Tab 'Tổng'
-            if ngay not in tong_theo_ngay:
-                tong_theo_ngay[ngay] = {"spend": 0, "mess": 0, "cmt": 0}
-            tong_theo_ngay[ngay]["spend"] += spend
-            tong_theo_ngay[ngay]["mess"] += mess
-            tong_theo_ngay[ngay]["cmt"] += cmt
+            for row in r_ins.get("data", []):
+                spend = int(float(row.get("spend", 0)))
+                if spend <= 0:
+                    continue
+                ngay = row.get("date_start", ngay_ymd)
+                c_name = row.get("campaign_name", "Khác")
+                ten_cum = tach_ten_cum(c_name)
+                mess, cmt, _, _, _ = trich_xuat_ket_qua(row.get("actions", []))
 
-            # 2. Cộng dồn vào Tab từng Cụm riêng biệt
-            key_cum = (ten_cum, ngay)
-            if key_cum not in cum_theo_ngay:
-                cum_theo_ngay[key_cum] = {"spend": 0, "mess": 0, "cmt": 0}
-            cum_theo_ngay[key_cum]["spend"] += spend
-            cum_theo_ngay[key_cum]["mess"] += mess
-            cum_theo_ngay[key_cum]["cmt"] += cmt
+                if ngay not in tong_theo_ngay:
+                    tong_theo_ngay[ngay] = {"spend": 0, "mess": 0, "cmt": 0}
+                tong_theo_ngay[ngay]["spend"] += spend
+                tong_theo_ngay[ngay]["mess"] += mess
+                tong_theo_ngay[ngay]["cmt"] += cmt
 
-    ds_items = []
-    for ngay, val in sorted(tong_theo_ngay.items()):
-        thue = int(val["spend"] * (THUE_VAT_FB / 100.0))
-        ds_items.append({
-            "tab_name": "Tổng",
-            "ngay": ngay,
-            "spend": val["spend"],
-            "tax": thue,
-            "total": val["spend"] + thue,
-            "mess": val["mess"],
-            "cmt": val["cmt"],
-        })
+                key_cum = (ten_cum, ngay)
+                if key_cum not in cum_theo_ngay:
+                    cum_theo_ngay[key_cum] = {"spend": 0, "mess": 0, "cmt": 0}
+                cum_theo_ngay[key_cum]["spend"] += spend
+                cum_theo_ngay[key_cum]["mess"] += mess
+                cum_theo_ngay[key_cum]["cmt"] += cmt
 
-    for (ten_cum, ngay), val in sorted(cum_theo_ngay.items()):
-        thue = int(val["spend"] * (THUE_VAT_FB / 100.0))
-        ds_items.append({
-            "tab_name": ten_cum,
-            "ngay": ngay,
-            "spend": val["spend"],
-            "tax": thue,
-            "total": val["spend"] + thue,
-            "mess": val["mess"],
-            "cmt": val["cmt"],
-        })
+        ds_items = []
+        for ngay, val in tong_theo_ngay.items():
+            thue = int(val["spend"] * (THUE_VAT_FB / 100.0))
+            ds_items.append({
+                "tab_name": "Tổng",
+                "ngay": ngay,
+                "spend": val["spend"],
+                "tax": thue,
+                "total": val["spend"] + thue,
+                "mess": val["mess"],
+                "cmt": val["cmt"],
+            })
+            danh_sach_tab_da_dien.add("Tổng")
 
-    if not ds_items:
-        return True, f"ℹ️ Không có phát sinh chi tiêu nào trong kỳ ({since_ymd} -> {until_ymd})."
+        for (ten_cum, ngay), val in cum_theo_ngay.items():
+            thue = int(val["spend"] * (THUE_VAT_FB / 100.0))
+            ds_items.append({
+                "tab_name": ten_cum,
+                "ngay": ngay,
+                "spend": val["spend"],
+                "tax": thue,
+                "total": val["spend"] + thue,
+                "mess": val["mess"],
+                "cmt": val["cmt"],
+            })
+            danh_sach_tab_da_dien.add(ten_cum)
 
-    ok, msg = gui_batch_len_google_sheet(ds_items)
-    so_ngay_co_so = len(tong_theo_ngay)
-    ds_ten_cum = sorted(list({k[0] for k in cum_theo_ngay.keys()}))
-    if ok:
+        if ds_items:
+            ok, _ = gui_batch_len_google_sheet(ds_items)
+            if ok:
+                tong_so_ngay_thanh_cong += 1
+            time.sleep(0.5) # Nghỉ nửa giây giữa các ngày để Google Sheet xử lý mượt mà
+
+    if tong_so_ngay_thanh_cong > 0:
+        ds_tab_str = ", ".join(sorted(list(danh_sach_tab_da_dien)))
         return True, (
-            f"✅ Đã cập nhật thành công lên Google Sheet!\n"
-            f"• Kỳ dữ liệu: {since_ymd} ➔ {until_ymd} ({so_ngay_co_so} ngày có chi tiêu)\n"
-            f"• Các Tab đã điền: Tổng, {', '.join(ds_ten_cum)}"
+            f"✅ Đã đồng bộ thành công lên Google Sheet!\n"
+            f"• Kỳ dữ liệu: {since_ymd} ➔ {until_ymd} ({tong_so_ngay_thanh_cong} ngày có chi tiêu)\n"
+            f"• Các Tab đã cập nhật: {ds_tab_str}"
         )
-    return False, f"⚠️ Lỗi khi đẩy lên Google Sheet: {msg}"
+    return False, f"ℹ️ Không có dữ liệu chi tiêu nào trong khoảng {since_ymd} -> {until_ymd}."
 
 
 def xac_dinh_khoang_ngay_tu_preset(che_do):
