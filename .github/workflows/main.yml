@@ -1,42 +1,11 @@
-name: Chay Bot Ads 24/7
-
-on:
-  repository_dispatch:
-    types: [thuc_day_bot]
-  workflow_dispatch:
-    inputs:
-      che_do:
-        description: 'Chế độ chạy (menu / today / yesterday)'
-        required: false
-        default: 'menu'
-
-concurrency:
-  group: bot-running-group
-  cancel-in-progress: true
-
-jobs:
-  run-bot:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout mã nguồn
-        uses: actions/checkout@v4
-
-      - name: Cài đặt Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.10'
-
-      - name: Cài đặt thư viện
-        run: |
-          pip install requests
-
-      - name: Khởi chạy Bot
+- name: Khởi chạy Bot
         env:
           FB_ACCESS_TOKEN: ${{ secrets.FB_ACCESS_TOKEN }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          SHEET_WEBHOOK_URL: ${{ secrets.SHEET_WEBHOOK_URL }}
           KPI_GIA_MESS: "60000"
           EVENT_NAME: ${{ github.event_name }}
           CHE_DO_INPUT: ${{ github.event.inputs.che_do }}
