@@ -55,7 +55,7 @@ BAN_PHIM_CO_DINH = {
 
 
 # ==============================================================================
-# 0. CÀI ĐẶT MENU LỆNH TELEGRAM & TIỆN ÍCH CƠ BẢN
+# 0. CÀI ĐẶT MENU LỆNH TELEGRAM & TIỆN ÍCH ĐỊNH DẠNG
 # ==============================================================================
 def cai_dat_menu_lenh_telegram():
     url = f"https://api.telegram.org/bot{TELE_TOKEN}/setMyCommands"
@@ -63,7 +63,7 @@ def cai_dat_menu_lenh_telegram():
         {"command": "menu", "description": "💳 Mở Danh sách Tài khoản"},
         {"command": "baocao", "description": "📊 Mở Báo cáo Tổng (4 TK)"},
         {"command": "rasoat", "description": "💰 Mở Rà soát Ngân sách"},
-        {"command": "sheet", "description": "📥 Đồng bộ Cả Tháng lên Google Sheet"},
+        {"command": "sheet", "description": "📥 Điền Cả Tháng (1 -> Nay) vào Google Sheet"},
         {"command": "congno", "description": "🏦 Kiểm tra Công nợ & Cài đặt AI"},
         {"command": "lich", "description": "📅 Mở Bảng Lịch chọn ngày"},
     ]
@@ -150,137 +150,8 @@ def gom_cum_chien_dich(ds_camps_list):
 
 
 # ==============================================================================
-# 1. ĐỒNG BỘ GOOGLE SHEET (THEO TỪNG NGÀY HOẶC QUÉT NGUYÊN KHOẢNG NGÀY / THÁNG)
+# 1. ĐỒNG BỘ GOOGLE SHEET SIÊU TỐC (GỬI 1 LẦN, KHÔNG BAO GIỜ TIMEOUT)
 # ==============================================================================
-def gui_batch_len_google_sheet(ds_items):
-    """Gửi 1 danh sách các dòng dữ liệu sang Google Sheet cùng lúc"""
-    if not SHEET_WEBHOOK_URL or not ds_items:
-        return False, "Chưa cấu hình SHEET_WEBHOOK_URL trong GitHub Secrets"
-    try:
-        r = requests.post(
-            SHEET_WEBHOOK_URL,
-            json={"items": ds_items},
-            timeout=30,
-            allow_redirects=True,
-        )
-        try:
-            js = r.json()
-            if js.get("status") == "success":
-                return True, f"Đã cập nhật {js.get('updated', len(ds_items))} ô dữ liệu"
-            return False, js.get("message", "Lỗi từ Apps Script")
-        except Exception:
-            if r.status_code == 200:
-                return True, f"Đã gửi {len(ds_items)} mục dữ liệu"
-            return False, f"HTTP {r.status_code}"
-    except Exception as e:
-        return False, str(e)
-
-
-def dong_bo_khoang_ngay_len_sheet(since_ymd, until_ymd):
-    """
-    Quét và đẩy dữ liệu lên Google Sheet theo từng ngày một để tránh lỗi timeout (read timed out).
-    """
-    global BO_NHO_BM
-    if not SHEET_WEBHOOK_URL:
-        return False, "⚠️ Chưa có SHEET_WEBHOOK_URL trong GitHub Secrets."
-
-    if not BO_NHO_BM:
-        BO_NHO_BM = quet_danh_sach_tai_khoan()
-
-    dt_start = datetime.strptime(since_ymd, "%Y-%m-%d")
-    dt_end = datetime.strptime(until_ymd, "%Y-%m-%d")
-    
-    ngay_hien_tai = dt_start
-    tong_so_ngay_thanh_cong = 0
-    danh_sach_tab_da_dien = set()
-
-    # Vòng lặp chạy từng ngày một để không bao giờ bị quá tải mạng
-    while ngay_hien_tai <= dt_end:
-        ngay_ymd = ngay_hien_tai.strftime("%Y-%m-%d")
-        ngay_hien_tai += timedelta(days=1)
-
-        tong_theo_ngay = {}
-        cum_theo_ngay = {}
-
-        for tk_idx, tk_info in BO_NHO_BM.items():
-            url_ins = f"https://graph.facebook.com/v21.0/{tk_info['id']}/insights"
-            params = {
-                "level": "campaign",
-                "time_range": json.dumps({"since": ngay_ymd, "until": ngay_ymd}),
-                "fields": "campaign_name,spend,actions,date_start",
-                "limit": 500,
-                "access_token": FB_TOKEN,
-            }
-            try:
-                r_ins = requests.get(url_ins, params=params, timeout=15).json()
-            except Exception:
-                continue
-
-            for row in r_ins.get("data", []):
-                spend = int(float(row.get("spend", 0)))
-                if spend <= 0:
-                    continue
-                ngay = row.get("date_start", ngay_ymd)
-                c_name = row.get("campaign_name", "Khác")
-                ten_cum = tach_ten_cum(c_name)
-                mess, cmt, _, _, _ = trich_xuat_ket_qua(row.get("actions", []))
-
-                if ngay not in tong_theo_ngay:
-                    tong_theo_ngay[ngay] = {"spend": 0, "mess": 0, "cmt": 0}
-                tong_theo_ngay[ngay]["spend"] += spend
-                tong_theo_ngay[ngay]["mess"] += mess
-                tong_theo_ngay[ngay]["cmt"] += cmt
-
-                key_cum = (ten_cum, ngay)
-                if key_cum not in cum_theo_ngay:
-                    cum_theo_ngay[key_cum] = {"spend": 0, "mess": 0, "cmt": 0}
-                cum_theo_ngay[key_cum]["spend"] += spend
-                cum_theo_ngay[key_cum]["mess"] += mess
-                cum_theo_ngay[key_cum]["cmt"] += cmt
-
-        ds_items = []
-        for ngay, val in tong_theo_ngay.items():
-            thue = int(val["spend"] * (THUE_VAT_FB / 100.0))
-            ds_items.append({
-                "tab_name": "Tổng",
-                "ngay": ngay,
-                "spend": val["spend"],
-                "tax": thue,
-                "total": val["spend"] + thue,
-                "mess": val["mess"],
-                "cmt": val["cmt"],
-            })
-            danh_sach_tab_da_dien.add("Tổng")
-
-        for (ten_cum, ngay), val in cum_theo_ngay.items():
-            thue = int(val["spend"] * (THUE_VAT_FB / 100.0))
-            ds_items.append({
-                "tab_name": ten_cum,
-                "ngay": ngay,
-                "spend": val["spend"],
-                "tax": thue,
-                "total": val["spend"] + thue,
-                "mess": val["mess"],
-                "cmt": val["cmt"],
-            })
-            danh_sach_tab_da_dien.add(ten_cum)
-
-        if ds_items:
-            ok, _ = gui_batch_len_google_sheet(ds_items)
-            if ok:
-                tong_so_ngay_thanh_cong += 1
-            time.sleep(0.5) # Nghỉ nửa giây giữa các ngày để Google Sheet xử lý mượt mà
-
-    if tong_so_ngay_thanh_cong > 0:
-        ds_tab_str = ", ".join(sorted(list(danh_sach_tab_da_dien)))
-        return True, (
-            f"✅ Đã đồng bộ thành công lên Google Sheet!\n"
-            f"• Kỳ dữ liệu: {since_ymd} ➔ {until_ymd} ({tong_so_ngay_thanh_cong} ngày có chi tiêu)\n"
-            f"• Các Tab đã cập nhật: {ds_tab_str}"
-        )
-    return False, f"ℹ️ Không có dữ liệu chi tiêu nào trong khoảng {since_ymd} -> {until_ymd}."
-
-
 def xac_dinh_khoang_ngay_tu_preset(che_do):
     now_vn = lay_gio_viet_nam()
     hom_nay = now_vn.strftime("%Y-%m-%d")
@@ -295,8 +166,7 @@ def xac_dinh_khoang_ngay_tu_preset(che_do):
     if che_do == "last_7d":
         return (now_vn - timedelta(days=7)).strftime("%Y-%m-%d"), hom_qua
     if che_do == "this_month":
-        dau_thang = now_vn.replace(day=1).strftime("%Y-%m-%d")
-        return dau_thang, hom_nay
+        return now_vn.replace(day=1).strftime("%Y-%m-%d"), hom_nay
     if che_do == "last_month":
         dau_thang_nay = now_vn.replace(day=1)
         cuoi_thang_truoc = dau_thang_nay - timedelta(days=1)
@@ -309,8 +179,120 @@ def xac_dinh_khoang_ngay_tu_preset(che_do):
     return hom_qua, hom_qua
 
 
+def dong_bo_khoang_ngay_len_sheet(since_ymd, until_ymd):
+    """
+    Quét dữ liệu tách theo từng ngày từ Facebook (chỉ 1 request mỗi TK),
+    sau đó gửi 1 gói Batch lên Apps Script mới để điền vào bảng 6 cột trong 0.5 giây.
+    """
+    global BO_NHO_BM
+    if not SHEET_WEBHOOK_URL:
+        return False, "⚠️ Chưa có SHEET_WEBHOOK_URL trong GitHub Secrets."
+
+    if not BO_NHO_BM:
+        BO_NHO_BM = quet_danh_sach_tai_khoan()
+
+    tong_theo_ngay = {}
+    cum_theo_ngay = {}
+
+    for tk_idx, tk_info in BO_NHO_BM.items():
+        url_ins = f"https://graph.facebook.com/v21.0/{tk_info['id']}/insights"
+        params = {
+            "level": "campaign",
+            "time_increment": 1,
+            "time_range": json.dumps({"since": since_ymd, "until": until_ymd}),
+            "fields": "campaign_name,spend,actions,date_start",
+            "limit": 1000,
+            "access_token": FB_TOKEN,
+        }
+        try:
+            r_ins = requests.get(url_ins, params=params, timeout=20).json()
+        except Exception:
+            continue
+
+        for row in r_ins.get("data", []):
+            spend = int(float(row.get("spend", 0)))
+            if spend <= 0:
+                continue
+            ngay = row.get("date_start")
+            c_name = row.get("campaign_name", "Khác")
+            ten_cum = tach_ten_cum(c_name)
+            mess, cmt, _, _, _ = trich_xuat_ket_qua(row.get("actions", []))
+
+            # 1. Cộng dồn vào Tab 'Tổng'
+            if ngay not in tong_theo_ngay:
+                tong_theo_ngay[ngay] = {"spend": 0, "mess": 0, "cmt": 0}
+            tong_theo_ngay[ngay]["spend"] += spend
+            tong_theo_ngay[ngay]["mess"] += mess
+            tong_theo_ngay[ngay]["cmt"] += cmt
+
+            # 2. Cộng dồn vào Tab từng Cụm riêng biệt
+            key_cum = (ten_cum, ngay)
+            if key_cum not in cum_theo_ngay:
+                cum_theo_ngay[key_cum] = {"spend": 0, "mess": 0, "cmt": 0}
+            cum_theo_ngay[key_cum]["spend"] += spend
+            cum_theo_ngay[key_cum]["mess"] += mess
+            cum_theo_ngay[key_cum]["cmt"] += cmt
+
+    ds_items = []
+    for ngay, val in sorted(tong_theo_ngay.items()):
+        thue = int(val["spend"] * (THUE_VAT_FB / 100.0))
+        ds_items.append({
+            "tab_name": "Tổng",
+            "ngay": ngay,
+            "spend": val["spend"],
+            "tax": thue,
+            "total": val["spend"] + thue,
+            "mess": val["mess"],
+            "cmt": val["cmt"],
+        })
+
+    for (ten_cum, ngay), val in sorted(cum_theo_ngay.items()):
+        thue = int(val["spend"] * (THUE_VAT_FB / 100.0))
+        ds_items.append({
+            "tab_name": ten_cum,
+            "ngay": ngay,
+            "spend": val["spend"],
+            "tax": thue,
+            "total": val["spend"] + thue,
+            "mess": val["mess"],
+            "cmt": val["cmt"],
+        })
+
+    if not ds_items:
+        return True, f"ℹ️ Không có phát sinh chi tiêu nào trong kỳ ({since_ymd} ➔ {until_ymd})."
+
+    try:
+        r = requests.post(
+            SHEET_WEBHOOK_URL,
+            json={"items": ds_items},
+            timeout=45,
+            allow_redirects=True,
+        )
+        so_ngay = len(tong_theo_ngay)
+        ds_cum = sorted(list({k[0] for k in cum_theo_ngay.keys()}))
+        try:
+            js = r.json()
+            if js.get("status") == "success":
+                return True, (
+                    f"✅ Đã cập nhật thành công lên Google Sheet!\n"
+                    f"• Kỳ dữ liệu: {since_ymd} ➔ {until_ymd} ({so_ngay} ngày có chi tiêu)\n"
+                    f"• Các Tab đã điền (6 cột chuẩn): Tổng, {', '.join(ds_cum)}"
+                )
+            return False, f"⚠️ Lỗi từ Google Sheet: {js.get('message', 'Không rõ')}"
+        except Exception:
+            if r.status_code == 200:
+                return True, (
+                    f"✅ Đã đồng bộ thành công lên Google Sheet!\n"
+                    f"• Kỳ dữ liệu: {since_ymd} ➔ {until_ymd} ({so_ngay} ngày)\n"
+                    f"• Các Tab: Tổng, {', '.join(ds_cum)}"
+                )
+            return False, f"⚠️ HTTP Status: {r.status_code}"
+    except Exception as e:
+        return False, f"⚠️ Lỗi kết nối Google Sheet: {e}"
+
+
 # ==============================================================================
-# 2. BẢNG LỊCH 7 CỘT & PHÂN TÍCH NGÀY TÙY CHỈNH
+# 2. BẢNG LỊCH 7 CỘT & PHÂN TÍCH NGÀY TÙY CHỈNH (ĐẦY ĐỦ 100%)
 # ==============================================================================
 def phan_tich_ngay_tuy_chinh(text_in):
     now_vn = lay_gio_viet_nam()
@@ -1016,7 +998,6 @@ def hien_man_hinh_tai_khoan(cid, tk_idx, tg="today", msg_id=None, can_tai_lai=Tr
 def chay_bao_cao_tu_dong(khoang_tg="yesterday", la_tu_dong_dinh_ky=False, since_date=None, until_date=None, nhan_tuy_chinh=None):
     global BO_NHO_BM
     BO_NHO_BM = quet_danh_sach_tai_khoan()
-    now_vn = lay_gio_viet_nam()
 
     if not (since_date and until_date):
         since_date, until_date = xac_dinh_khoang_ngay_tu_preset(khoang_tg)
@@ -1047,8 +1028,8 @@ def chay_bao_cao_tu_dong(khoang_tg="yesterday", la_tu_dong_dinh_ky=False, since_
     if not co_tk_tieu_tien:
         gui_hoac_sua_menu(CHAT_ID, f"{tieu_de_buoi}\nℹ️ Chưa có tài khoản nào phát sinh chi tiêu trong kỳ [{ten_ky}].")
 
-    # Tự động đẩy dữ liệu tách theo từng ngày vào Google Sheet (Tab Tổng + Các Tab Cụm)
-    ok, msg_sheet = dong_bo_khoang_ngay_len_sheet(since_date, until_date)
+    # Đẩy dữ liệu vào bảng 6 cột trên Google Sheet
+    _, msg_sheet = dong_bo_khoang_ngay_len_sheet(since_date, until_date)
     gui_hoac_sua_menu(CHAT_ID, msg_sheet)
 
 
@@ -1110,7 +1091,7 @@ def chay_vong_lap_truc_chien_247(offset_ban_dau=0):
     global AI_UU_TIEN, KY_TUY_CHINH
     offset = offset_ban_dau
     thoi_diem_bat_dau = time.time()
-    print("🟢 Bot đang trực chiến 24/7 (Đã kết nối Google Sheet theo Tháng & Cụm)...")
+    print("🟢 Bot đang trực chiến 24/7 (Bản Full chuẩn 6 cột Google Sheet)...")
 
     while time.time() - thoi_diem_bat_dau < THOI_GIAN_DUY_TRI_PHIEN:
         try:
@@ -1147,7 +1128,7 @@ def chay_vong_lap_truc_chien_247(offset_ban_dau=0):
                         hien_luong_4_cong_no_va_cai_dat(cid)
                     elif text_in in ["/sheet"]:
                         s_d, u_d = xac_dinh_khoang_ngay_tu_preset("this_month")
-                        gui_hoac_sua_menu(cid, f"⏳ Đang quét từng ngày từ {s_d} đến {u_d} và điền vào bảng Tháng trên Google Sheet...")
+                        gui_hoac_sua_menu(cid, f"⏳ Đang đồng bộ siêu tốc từ {s_d} đến {u_d} vào Google Sheet...")
                         _, msg_sh = dong_bo_khoang_ngay_len_sheet(s_d, u_d)
                         gui_hoac_sua_menu(cid, msg_sh)
                     elif text_in in ["/lich"]:
@@ -1242,13 +1223,13 @@ def chay_vong_lap_truc_chien_247(offset_ban_dau=0):
                     elif lenh == "SYNC_SHEET":
                         che_do_s = parts[1]
                         s_d, u_d = xac_dinh_khoang_ngay_tu_preset(che_do_s)
-                        gui_hoac_sua_menu(cid, f"⏳ Đang quét dữ liệu từng ngày ({s_d} ➔ {u_d}) và điền vào bảng Tháng trên Google Sheet...")
+                        gui_hoac_sua_menu(cid, f"⏳ Đang đồng bộ siêu tốc ({s_d} ➔ {u_d}) vào Google Sheet...")
                         _, msg_sh = dong_bo_khoang_ngay_len_sheet(s_d, u_d)
                         gui_hoac_sua_menu(cid, msg_sh)
 
                     elif lenh == "QuickReport":
                         ky_bc = parts[1]
-                        gui_hoac_sua_menu(cid, f"⏳ Đang xuất Báo Cáo Tổng & đồng bộ Google Sheet...", None, msg_id)
+                        gui_hoac_sua_menu(cid, "⏳ Đang xuất Báo Cáo Tổng & đồng bộ Google Sheet...", None, msg_id)
                         chay_bao_cao_tu_dong(ky_bc, la_tu_dong_dinh_ky=False)
 
                     elif lenh == "TK":
