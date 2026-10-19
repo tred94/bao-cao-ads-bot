@@ -147,7 +147,7 @@ def gom_cum_chien_dich(ds_camps_list):
 
 def day_du_lieu_len_google_sheet(tab_name, ngay_ymd, spend, mess, cmt):
     if not SHEET_WEBHOOK_URL:
-        return
+        return False
     thue = int(spend * (THUE_VAT_FB / 100.0))
     tong = spend + thue
     payload = {
@@ -160,9 +160,11 @@ def day_du_lieu_len_google_sheet(tab_name, ngay_ymd, spend, mess, cmt):
         "cmt": cmt
     }
     try:
-        requests.post(SHEET_WEBHOOK_URL, json=payload, timeout=10)
+        r = requests.post(SHEET_WEBHOOK_URL, json=payload, timeout=10).json()
+        return r.get("status") == "success"
     except Exception as e:
         print("⚠️ Lỗi đồng bộ Google Sheet:", e)
+        return False
 
 
 def phan_tich_ngay_tuy_chinh(text_in):
@@ -437,6 +439,7 @@ def rà_soat_chi_tieu_bm(che_do="this_month", since_date=None, until_date=None, 
     if hang_nut_tk: nut_xem_nhom.append(hang_nut_tk)
 
     lines.append("━━━━━━━━━━━━━━━━━━━━")
+    # 👉 THÊM LUÔN NÚT ĐẨY GOOGLE SHEET TRỰC TIẾP TẠI ĐÂY
     nut_xem_nhom.append([
         {"text": "📊 Đẩy lên Google Sheet", "callback_data": f"SYNC_SHEET|{che_do}"},
         {"text": "📅 Bảng Lịch", "callback_data": "CAL_OPEN|AUDIT"}
@@ -600,7 +603,14 @@ def hien_luong_4_cong_no_va_cai_dat(cid, msg_id=None):
     tong_no = sum(acc["balance"] for acc in BO_NHO_BM.values())
     thue = int(tong_no * (THUE_VAT_FB / 100.0))
     van_ban = f"🏦 CÔNG NỢ & THẺ\n━━━━━━━━━━━━━━━━━━━━\n💰 Tổng nợ: {tong_no:,}đ + VAT: {thue:,}đ ➔ Tổng: {tong_no + thue:,}đ"
-    gui_hoac_sua_menu(cid, van_ban, [[{"text": "🔄 Làm mới", "callback_data": "REFRESH_ALL"}], [{"text": "🏠 Menu Chính", "callback_data": "HOME"}]], msg_id)
+    
+    # 👉 Thêm nút Đồng bộ nhanh Google Sheet ngay trong menu Công Nợ
+    nut = [
+        [{"text": "📥 Đồng Bộ Lên Google Sheet (Hôm qua)", "callback_data": "SYNC_SHEET|yesterday"}],
+        [{"text": "🔄 Làm mới dữ liệu", "callback_data": "REFRESH_ALL"}],
+        [{"text": "🏠 Menu Chính", "callback_data": "HOME"}]
+    ]
+    gui_hoac_sua_menu(cid, van_ban, nut, msg_id)
 
 
 def hien_menu_chon_luong_cho_ngay_tuy_chinh(cid, msg_id=None):
@@ -636,24 +646,30 @@ def hien_man_hinh_tai_khoan(cid, tk_idx, tg="today", msg_id=None, can_tai_lai=Tr
     gui_hoac_sua_menu(cid, tom_tat, nut, msg_id)
 
 
-def chay_bao_cao_tu_dong(khoang_tg="today", la_tu_dong_dinh_ky=False, since_date=None, until_date=None, nhan_tuy_chinh=None):
+def chay_bao_cao_tu_dong(khoang_tg="yesterday", la_tu_dong_dinh_ky=False, since_date=None, until_date=None, nhan_tuy_chinh=None):
     global BO_NHO_BM
     BO_NHO_BM = quet_danh_sach_tai_khoan()
     ymd_hom_qua = (lay_gio_viet_nam() - timedelta(days=1)).strftime("%Y-%m-%d")
     ymd_hom_nay = lay_gio_viet_nam().strftime("%Y-%m-%d")
-    ngay_sync = ymd_hom_qua if (khoang_tg == "yesterday" or la_tu_dong_dinh_ky) else ymd_hom_nay
+    ngay_sync = ymd_hom_qua if (khoang_tg in ["yesterday", "custom"] or la_tu_dong_dinh_ky) else ymd_hom_nay
+    if since_date: ngay_sync = since_date
 
+    thanh_cong = 0
     for tk_idx, tk_info in BO_NHO_BM.items():
         du_lieu = tai_du_lieu_5_tang(tk_info["id"], khoang_tg, since_date, until_date)
         if du_lieu["tong_tien_tk"] > 0:
-            # 1. Đẩy Tab Tổng cho tài khoản này
-            day_du_lieu_len_google_sheet(rut_gon_ten_tk(tk_info["ten"]), ngay_sync, du_lieu["tong_tien_tk"], du_lieu["tong_mess_tk"], sum(c["binh_luan"] for c in du_lieu["camps_list"]))
+            # 1. Đẩy Tab Tổng cho tài khoản
+            ok1 = day_du_lieu_len_google_sheet(rut_gon_ten_tk(tk_info["ten"]), ngay_sync, du_lieu["tong_tien_tk"], du_lieu["tong_mess_tk"], sum(c["binh_luan"] for c in du_lieu["camps_list"]))
+            if ok1: thanh_cong += 1
             # 2. Đẩy từng Tab Cụm
             for c_gr in du_lieu["cum_list"]:
                 day_du_lieu_len_google_sheet(f"{rut_gon_ten_tk(tk_info['ten'])}_{c_gr['ten_cum']}", ngay_sync, c_gr["chi_tieu"], c_gr["tin_nhan"], c_gr["binh_luan"])
 
     if not la_tu_dong_dinh_ky:
-        gui_hoac_sua_menu(CHAT_ID, f"✅ Đã đồng bộ toàn bộ dữ liệu lên Google Sheet cho ngày {ngay_sync}!")
+        if thanh_cong > 0:
+            gui_hoac_sua_menu(CHAT_ID, f"✅ Đã đồng bộ thành công dữ liệu ngày [{ngay_sync}] lên Google Sheet!")
+        else:
+            gui_hoac_sua_menu(CHAT_ID, f"⚠️ Chưa kết nối được Google Sheet. Vui lòng kiểm tra lại SHEET_WEBHOOK_URL trong GitHub Secrets.")
 
 
 def da_bao_cao_xuyen_phien(ma_ngay_gio):
