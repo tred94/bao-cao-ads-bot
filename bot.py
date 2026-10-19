@@ -10,7 +10,7 @@ from datetime import datetime, timezone, timedelta
 # 🛠️ KHU VỰC CẤU HÌNH DỄ CHỈNH SỬA
 # ==============================================================================
 KPI_MESS = int(os.environ.get("KPI_GIA_MESS") or "60000")      # Mốc KPI giá mỗi tin nhắn (VNĐ)
-THUE_VAT_FB = float(os.environ.get("THUE_VAT_FB") or "10.0")    # % Thuế VAT Facebook (Mặc định 5%)
+THUE_VAT_FB = float(os.environ.get("THUE_VAT_FB") or "10.0")   # % Thuế VAT Facebook (Chuẩn 10%)
 GIO_BAO_CAO_SANG = 8                                           # 8h sáng -> Tự báo số liệu HÔM QUA (yesterday)
 GIO_BAO_CAO_TOI = 20                                           # 20h tối -> Tự báo số liệu HÔM NAY (today)
 THOI_GIAN_DUY_TRI_PHIEN = 54 * 60                              # Giữ Bot thức liên tục 54 phút (nối tiếp mỗi giờ = 24/24)
@@ -513,17 +513,18 @@ def rà_soat_chi_tieu_bm(che_do="this_month", since_date=None, until_date=None, 
         })
 
     ds_ket_qua.sort(key=lambda x: x["spend"], reverse=True)
-    gia_tb_bm = int(tong_chi_bm / tong_mess_bm) if tong_mess_bm > 0 else 0
     tien_thue = int(tong_chi_bm * (THUE_VAT_FB / 100.0))
     tong_sau_thue = tong_chi_bm + tien_thue
+    gia_tb_bm = int(tong_chi_bm / tong_mess_bm) if tong_mess_bm > 0 else 0
+    gia_tb_sau_thue = int(tong_sau_thue / tong_mess_bm) if tong_mess_bm > 0 else 0
 
     lines = [
         f"💰 RÀ SOÁT NGÂN SÁCH ({nhan_hien_thi})",
         "━━━━━━━━━━━━━━━━━━━━",
-        f"🔥 TỔNG CHI TIÊU ADS: {tong_chi_bm:,}đ",
+        f"🔥 Chi phí QC: {tong_chi_bm:,}đ",
         f"🧾 Thuế VAT ({THUE_VAT_FB}%): +{tien_thue:,}đ",
-        f"💳 TỔNG THỰC TRỪ THẺ: {tong_sau_thue:,}đ",
-        f"💬 Kết quả: {tong_mess_bm:,} mess (TB: {gia_tb_bm:,}đ/m) | {tong_cmt_bm:,} cmt",
+        f"💰 TỔNG CHI PHÍ (QC + Thuế): {tong_sau_thue:,}đ",
+        f"💬 Kết quả: {tong_mess_bm:,} mess (TB: {gia_tb_bm:,}đ/m | Sau thuế: {gia_tb_sau_thue:,}đ/m) | {tong_cmt_bm:,} cmt",
         "━━━━━━━━━━━━━━━━━━━━",
     ]
 
@@ -534,9 +535,11 @@ def rà_soat_chi_tieu_bm(che_do="this_month", since_date=None, until_date=None, 
             gia_m = int(item["spend"] / item["mess"]) if item["mess"] > 0 else 0
             ty_trong = round((item["spend"] / tong_chi_bm) * 100, 1) if tong_chi_bm > 0 else 0
             thue_tk = int(item["spend"] * (THUE_VAT_FB / 100.0))
+            tong_cp_tk = item["spend"] + thue_tk
             lines.append(
-                f"{idx}. {item['icon']} {item['ten']}: {item['spend']:,}đ ({ty_trong}%)\n"
-                f"   • +Thuế: {item['spend'] + thue_tk:,}đ | {item['mess']} mess ({dinh_dang_tien_gon(gia_m)}/m)"
+                f"{idx}. {item['icon']} {item['ten']} ({ty_trong}%)\n"
+                f"   • QC: {item['spend']:,}đ + Thuế: {thue_tk:,}đ ➔ Tổng chi phí: {tong_cp_tk:,}đ\n"
+                f"   • KQ: {item['mess']} mess ({dinh_dang_tien_gon(gia_m)}/m) | {item['cmt']} cmt"
             )
             for c_gr in item["cum_list"]:
                 g_cum = int(c_gr["chi_tieu"] / c_gr["tin_nhan"]) if c_gr["tin_nhan"] > 0 else 0
@@ -574,10 +577,13 @@ def tao_bang_chi_tiet_nhom_audit(tk_idx):
     nhan_tg = info["nhan_hien_thi"]
     du_lieu = info["data"]
     tong_tien_tk = du_lieu["tong_tien_tk"]
+    thue_tk = int(tong_tien_tk * (THUE_VAT_FB / 100.0))
+    tong_cp_tk = tong_tien_tk + thue_tk
 
     lines = [
         f"📂 CHI TIẾT NHÓM (ADSET) - {ten_tk}",
-        f"📅 Kỳ: {nhan_tg} | 💰 Tổng: {tong_tien_tk:,}đ",
+        f"📅 Kỳ: {nhan_tg}",
+        f"💰 QC: {tong_tien_tk:,}đ + Thuế ({THUE_VAT_FB}%): {thue_tk:,}đ ➔ Tổng chi phí: {tong_cp_tk:,}đ",
         "━━━━━━━━━━━━━━━━━━━━",
     ]
 
@@ -923,7 +929,7 @@ def hien_luong_3_ra_soat_ngan_sach(cid, msg_id=None):
     van_ban = (
         f"💰 RÀ SOÁT NGÂN SÁCH (TÀI KHOẢN / CỤM / NHÓM)\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"Chọn khung thời gian hoặc mở Bảng Lịch bên dưới để kiểm toán tổng chi tiêu + Thuế VAT ({THUE_VAT_FB}%) và bóc tách từng Nhóm (AdSet):"
+        f"Chọn khung thời gian hoặc mở Bảng Lịch bên dưới để kiểm toán: Tổng chi phí = Chi phí QC + Thuế VAT ({THUE_VAT_FB}%) và bóc tách từng Nhóm (AdSet):"
     )
     nut_bam = tao_khung_thoi_gian_chuan("AUDIT", tg_hien_tai=None, target_lich="AUDIT")
     gui_hoac_sua_menu(cid, van_ban, nut_bam, msg_id)
@@ -967,9 +973,9 @@ def hien_luong_4_cong_no_va_cai_dat(cid, msg_id=None):
     tong_can_chuan_bi = tong_no_bm + thue_du_kien
 
     tom_tat_dau = [
-        f"💰 TỔNG NỢ HIỆN TẠI: {tong_no_bm:,}đ",
+        f"🔥 Dư nợ QC hiện tại: {tong_no_bm:,}đ",
         f"🧾 Thuế VAT ({THUE_VAT_FB}%): +{thue_du_kien:,}đ",
-        f"💳 Cần chuẩn bị trong thẻ: {tong_can_chuan_bi:,}đ",
+        f"💰 TỔNG CHI PHÍ CẦN THANH TOÁN: {tong_can_chuan_bi:,}đ",
         f"🚨 Có {so_tk_loi} TK lỗi thanh toán!" if so_tk_loi > 0 else "✅ Tất cả thẻ & TK đều hoạt động tốt.",
         "━━━━━━━━━━━━━━━━━━━━",
     ]
@@ -1056,8 +1062,10 @@ def hien_man_hinh_tai_khoan(cid, tk_idx, tg="today", msg_id=None, can_tai_lai=Tr
 
     tong_tien = du_lieu_tk["tong_tien_tk"]
     tong_mess = du_lieu_tk["tong_mess_tk"]
-    gia_tb = int(tong_tien / tong_mess) if tong_mess > 0 else 0
     thue_tk = int(tong_tien * (THUE_VAT_FB / 100.0))
+    tong_cp_tk = tong_tien + thue_tk
+    gia_tb = int(tong_tien / tong_mess) if tong_mess > 0 else 0
+    gia_tb_sau_thue = int(tong_cp_tk / tong_mess) if tong_mess > 0 else 0
     luc_cap_nhat = du_lieu_tk.get("thoi_diem_cap_nhat", lay_gio_viet_nam().strftime("%H:%M"))
 
     cum_list = du_lieu_tk.get("cum_list", [])
@@ -1071,8 +1079,9 @@ def hien_man_hinh_tai_khoan(cid, tk_idx, tg="today", msg_id=None, can_tai_lai=Tr
         f"💳 {tk_info['ten']}\n"
         f"📅 Kỳ: {ten_tg} (Lúc {luc_cap_nhat})\n"
         f"📌 Bật: {du_lieu_tk['so_camp_active']}/{du_lieu_tk['tong_so_camp']} camp | 🔥 Có tiêu: {du_lieu_tk['so_camp_co_tieu_tien']} camp\n"
-        f"💰 Tiêu: {tong_tien:,}đ (+VAT: {tong_tien + thue_tk:,}đ)\n"
-        f"💬 KQ: {tong_mess} mess (TB: {gia_tb:,}đ/mess)\n\n"
+        f"🔥 Chi phí QC: {tong_tien:,}đ | 🧾 Thuế ({THUE_VAT_FB}%): +{thue_tk:,}đ\n"
+        f"💰 TỔNG CHI PHÍ: {tong_cp_tk:,}đ\n"
+        f"💬 KQ: {tong_mess} mess (TB: {gia_tb:,}đ/m | Sau thuế: {gia_tb_sau_thue:,}đ/m)\n\n"
         f"{bang_cum_gon}"
     )
 
@@ -1238,13 +1247,17 @@ def chay_bao_cao_tu_dong(khoang_tg="today", la_tu_dong_dinh_ky=False, since_date
                 f"{tk_info['ten']} ({ten_ky})", du_lieu["cum_list"], du_lieu["tong_tien_tk"], chi_tiet_cho_ai=True
             )
             nhan_xet = gemini_danh_gia_chuyen_sau(f"{tk_info['ten']} ({ten_ky})", bang_day_du_cho_ai)
-            gia_tb = int(du_lieu["tong_tien_tk"] / du_lieu["tong_mess_tk"]) if du_lieu["tong_mess_tk"] > 0 else 0
-            thue_tk = int(du_lieu["tong_tien_tk"] * (THUE_VAT_FB / 100.0))
+            tong_qc = du_lieu["tong_tien_tk"]
+            thue_tk = int(tong_qc * (THUE_VAT_FB / 100.0))
+            tong_cp = tong_qc + thue_tk
+            gia_tb = int(tong_qc / du_lieu["tong_mess_tk"]) if du_lieu["tong_mess_tk"] > 0 else 0
+            gia_tb_sau_thue = int(tong_cp / du_lieu["tong_mess_tk"]) if du_lieu["tong_mess_tk"] > 0 else 0
             mo_dau = (
                 f"{tieu_de_buoi}\n"
                 f"💳 TK: {tk_info['ten']}\n"
-                f"💰 Tiêu: {du_lieu['tong_tien_tk']:,}đ (+VAT: {du_lieu['tong_tien_tk'] + thue_tk:,}đ)\n"
-                f"💬 KQ: {du_lieu['tong_mess_tk']} mess (TB: {gia_tb:,}đ/m)\n\n"
+                f"🔥 Chi phí QC: {tong_qc:,}đ | 🧾 Thuế ({THUE_VAT_FB}%): +{thue_tk:,}đ\n"
+                f"💰 TỔNG CHI PHÍ: {tong_cp:,}đ\n"
+                f"💬 KQ: {du_lieu['tong_mess_tk']} mess (TB: {gia_tb:,}đ/m | Sau thuế: {gia_tb_sau_thue:,}đ/m)\n\n"
             )
             gui_hoac_sua_menu(CHAT_ID, mo_dau + bang_hien_thi_gon + "\n\n" + nhan_xet)
 
@@ -1741,10 +1754,13 @@ def chay_vong_lap_truc_chien_247(offset_ban_dau=0):
                             if a_info.get("hook_rate", 0) > 0
                             else ""
                         )
+                        thue_ad = int(a_info["chi_tieu"] * (THUE_VAT_FB / 100.0))
+                        tong_cp_ad = a_info["chi_tieu"] + thue_ad
                         chi_tiet_ad = (
                             f"📝 BÀI ADS: {a_info['ten']}\n"
                             f"• Camp: {c_info['ten']} | Nhóm: {g_info['ten']}\n"
-                            f"• Tiêu: {a_info['chi_tieu']:,}đ ➔ {a_info['tin_nhan']} mess ({a_info['gia_mess']:,}đ/m) | {a_info['binh_luan']} cmt\n"
+                            f"• QC: {a_info['chi_tieu']:,}đ + Thuế: {thue_ad:,}đ ➔ Tổng chi phí: {tong_cp_ad:,}đ\n"
+                            f"• KQ: {a_info['tin_nhan']} mess ({a_info['gia_mess']:,}đ/m) | {a_info['binh_luan']} cmt\n"
                             f"• Tệp: CPM {a_info['cpm']:,}đ | Freq {a_info['frequency']} | Reach {a_info['reach']:,}\n"
                             f"• Phễu: CTR {a_info['ctr']}% | CPC {a_info['cpc']:,}đ | CR {a_info['cr_click_to_mess']}%{dong_vid_ad}"
                         )
