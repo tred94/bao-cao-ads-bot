@@ -10,7 +10,7 @@ from datetime import datetime, timezone, timedelta
 # 🛠️ KHU VỰC CẤU HÌNH DỄ CHỈNH SỬA
 # ==============================================================================
 KPI_MESS = int(os.environ.get("KPI_GIA_MESS") or "60000")      # Mốc KPI giá mỗi tin nhắn (VNĐ)
-THUE_VAT_FB = float(os.environ.get("THUE_VAT_FB") or "5.0")    # % Thuế VAT Facebook (Mặc định 5%)
+THUE_VAT_FB = float(os.environ.get("THUE_VAT_FB") or "10.0")    # % Thuế VAT Facebook (Mặc định 5%)
 GIO_BAO_CAO_SANG = 8                                           # 8h sáng -> Tự báo số liệu HÔM QUA (yesterday)
 GIO_BAO_CAO_TOI = 20                                           # 20h tối -> Tự báo số liệu HÔM NAY (today)
 THOI_GIAN_DUY_TRI_PHIEN = 54 * 60                              # Giữ Bot thức liên tục 54 phút (nối tiếp mỗi giờ = 24/24)
