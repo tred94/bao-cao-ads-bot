@@ -4,6 +4,11 @@ on:
   repository_dispatch:
     types: [thuc_day_bot]
   workflow_dispatch:
+    inputs:
+      che_do:
+        description: 'Chế độ chạy (menu / today / yesterday)'
+        required: false
+        default: 'menu'
 
 concurrency:
   group: bot-running-group
@@ -33,4 +38,6 @@ jobs:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           KPI_GIA_MESS: "60000"
+          EVENT_NAME: ${{ github.event_name }}
+          CHE_DO_INPUT: ${{ github.event.inputs.che_do }}
         run: python bot.py
