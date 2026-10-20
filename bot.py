@@ -4,6 +4,7 @@ import json
 import time
 import calendar
 import requests
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone, timedelta
 
 # ==============================================================================
@@ -14,7 +15,8 @@ THUE_VAT_FB = float(os.environ.get("THUE_VAT_FB") or "10.0")
 GIO_BAO_CAO_SANG = 8
 GIO_BAO_CAO_TOI = 20
 THOI_GIAN_DUY_TRI_PHIEN = 54 * 60
- 
+THOI_GIAN_CACHE_GIAY = 90  # Giữ cache 90s để bấm chuyển tab nhanh tức thì
+
 FB_TOKEN = (os.environ.get("FB_ACCESS_TOKEN") or "").strip()
 GEMINI_KEY = (os.environ.get("GEMINI_API_KEY") or "").strip()
 OPENAI_KEY = (os.environ.get("OPENAI_API_KEY") or "").strip()
@@ -27,12 +29,25 @@ SHEET_WEBHOOK_URL = (os.environ.get("SHEET_WEBHOOK_URL") or "").strip()
 
 AI_UU_TIEN = "gemini"
 
+# Khởi tạo Phiên kết nối liên tục (Keep-Alive Session) giúp giảm 70% độ trễ mạng
+HTTP = requests.Session()
+ADAPTER = requests.adapters.HTTPAdapter(pool_connections=20, pool_maxsize=20, max_retries=2)
+HTTP.mount("https://", ADAPTER)
+HTTP.mount("http://", ADAPTER)
+
+# Bộ nhớ đệm tốc độ cao
 BO_NHO_BM = {}
 BO_NHO_TK = {}
 BO_NHO_AUDIT = {}
+CACHE_INSIGHTS = {}  # {(ma_tk, key_tg): (timestamp, data)}
+DANH_SACH_MODEL_GEMINI = None
 TRANG_THAI_LICH = {}
 KY_TUY_CHINH = None
 DA_BAO_CAO_TRONG_PHIEN = set()
+
+# Quản lý Giao diện Đơn Trang (Single-Message Dashboard)
+DASHBOARD_MSG_ID = {}        # {chat_id: message_id_chinh}
+TIN_NHAN_PHU_CAN_XOA = {}    # {chat_id: [ds_message_id_phu]}
 
 NHAN_THOI_GIAN = {
     "today": "Hôm nay (Realtime)",
@@ -68,7 +83,7 @@ def cai_dat_menu_lenh_telegram():
         {"command": "lich", "description": "📅 Mở Bảng Lịch chọn ngày"},
     ]
     try:
-        requests.post(url, json={"commands": commands}, timeout=5)
+        HTTP.post(url, json={"commands": commands}, timeout=5)
     except Exception:
         pass
 
@@ -149,8 +164,169 @@ def gom_cum_chien_dich(ds_camps_list):
     return ds_cum_sorted
 
 
+def xoa_sach_cache():
+    BO_NHO_BM.clear()
+    BO_NHO_TK.clear()
+    BO_NHO_AUDIT.clear()
+    CACHE_INSIGHTS.clear()
+
+
 # ==============================================================================
-# 1. ĐỒNG BỘ GOOGLE SHEET SIÊU TỐC (GỬI 1 LẦN, KHÔNG BAO GIỜ TIMEOUT)
+# 1. CƠ CHẾ GIAO DIỆN ĐƠN TRANG (TỰ XÓA TIN THỪA & CẬP NHẬT TẠI CHỖ)
+# ==============================================================================
+def xoa_tin_nhan_an_toan(chat_id, message_id):
+    if not message_id:
+        return
+    try:
+        HTTP.post(
+            f"https://api.telegram.org/bot{TELE_TOKEN}/deleteMessage",
+            json={"chat_id": chat_id, "message_id": message_id},
+            timeout=3,
+        )
+    except Exception:
+        pass
+
+
+def don_dep_tin_nhan_phu(chat_id):
+    key = str(chat_id)
+    ds_phu = TIN_NHAN_PHU_CAN_XOA.get(key, [])
+    if ds_phu:
+        for mid in ds_phu:
+            xoa_tin_nhan_an_toan(chat_id, mid)
+        TIN_NHAN_PHU_CAN_XOA[key] = []
+
+
+def gui_ban_phim_co_dinh(chat_id, loi_nhan="⌨️ Đã bật Thanh Điều Hướng 4 Luồng dưới đáy màn hình!"):
+    try:
+        r = HTTP.post(
+            f"https://api.telegram.org/bot{TELE_TOKEN}/sendMessage",
+            json={"chat_id": chat_id, "text": loi_nhan, "reply_markup": BAN_PHIM_CO_DINH},
+            timeout=5,
+        ).json()
+        if r.get("ok"):
+            time.sleep(0.4)
+            xoa_tin_nhan_an_toan(chat_id, r["result"]["message_id"])
+    except Exception:
+        pass
+
+
+def gui_hoac_sua_menu(chat_id, van_ban, nut_bam=None, msg_id=None, giu_co_dinh=False):
+    key_cid = str(chat_id)
+
+    # 1. Nếu là Báo cáo 8h sáng cố định -> Gửi tin nhắn độc lập để lưu lịch sử
+    if giu_co_dinh:
+        url = f"https://api.telegram.org/bot{TELE_TOKEN}/sendMessage"
+        cac_dong = van_ban.split("\n")
+        doan, cac_phan = "", []
+        for dong in cac_dong:
+            if len(doan) + len(dong) + 1 > 3800:
+                cac_phan.append(doan)
+                doan = dong + "\n"
+            else:
+                doan += dong + "\n"
+        if doan.strip():
+            cac_phan.append(doan)
+
+        for idx, p in enumerate(cac_phan):
+            payload = {"chat_id": chat_id, "text": p}
+            if idx == len(cac_phan) - 1:
+                payload["reply_markup"] = {"inline_keyboard": nut_bam} if nut_bam else BAN_PHIM_CO_DINH
+            HTTP.post(url, json=payload, timeout=10)
+        return
+
+    # 2. Dọn sạch các tin nhắn phụ (nếu có từ lần xem trước)
+    don_dep_tin_nhan_phu(chat_id)
+
+    target_mid = msg_id or DASHBOARD_MSG_ID.get(key_cid)
+
+    cac_dong = van_ban.split("\n")
+    doan, cac_phan = "", []
+    for dong in cac_dong:
+        if len(doan) + len(dong) + 1 > 3800:
+            cac_phan.append(doan)
+            doan = dong + "\n"
+        else:
+            doan += dong + "\n"
+    if doan.strip():
+        cac_phan.append(doan)
+    if not cac_phan:
+        cac_phan = [van_ban]
+
+    # Trường hợp 1 khung duy nhất (nhanh và gọn nhất)
+    if len(cac_phan) == 1:
+        if target_mid:
+            payload = {"chat_id": chat_id, "message_id": target_mid, "text": cac_phan[0]}
+            if nut_bam:
+                payload["reply_markup"] = {"inline_keyboard": nut_bam}
+            try:
+                r = HTTP.post(
+                    f"https://api.telegram.org/bot{TELE_TOKEN}/editMessageText",
+                    json=payload,
+                    timeout=8,
+                ).json()
+                if r.get("ok") or "message is not modified" in str(r.get("description", "")):
+                    DASHBOARD_MSG_ID[key_cid] = target_mid
+                    return
+            except Exception:
+                pass
+            xoa_tin_nhan_an_toan(chat_id, target_mid)
+
+        payload = {"chat_id": chat_id, "text": cac_phan[0]}
+        payload["reply_markup"] = {"inline_keyboard": nut_bam} if nut_bam else BAN_PHIM_CO_DINH
+        try:
+            r_new = HTTP.post(
+                f"https://api.telegram.org/bot{TELE_TOKEN}/sendMessage",
+                json=payload,
+                timeout=8,
+            ).json()
+            if r_new.get("ok"):
+                DASHBOARD_MSG_ID[key_cid] = r_new["result"]["message_id"]
+        except Exception:
+            pass
+        return
+
+    # Trường hợp nội dung rất dài (> 3800 ký tự)
+    for idx, p in enumerate(cac_phan):
+        la_phan_cuoi = (idx == len(cac_phan) - 1)
+        if idx == 0 and target_mid:
+            payload = {"chat_id": chat_id, "message_id": target_mid, "text": p}
+            if la_phan_cuoi and nut_bam:
+                payload["reply_markup"] = {"inline_keyboard": nut_bam}
+            try:
+                r = HTTP.post(
+                    f"https://api.telegram.org/bot{TELE_TOKEN}/editMessageText",
+                    json=payload,
+                    timeout=8,
+                ).json()
+                if r.get("ok") or "message is not modified" in str(r.get("description", "")):
+                    DASHBOARD_MSG_ID[key_cid] = target_mid
+                    continue
+            except Exception:
+                pass
+            xoa_tin_nhan_an_toan(chat_id, target_mid)
+            target_mid = None
+
+        payload = {"chat_id": chat_id, "text": p}
+        if la_phan_cuoi and nut_bam:
+            payload["reply_markup"] = {"inline_keyboard": nut_bam}
+        try:
+            r_part = HTTP.post(
+                f"https://api.telegram.org/bot{TELE_TOKEN}/sendMessage",
+                json=payload,
+                timeout=8,
+            ).json()
+            if r_part.get("ok"):
+                new_mid = r_part["result"]["message_id"]
+                if idx == 0 and not target_mid:
+                    DASHBOARD_MSG_ID[key_cid] = new_mid
+                else:
+                    TIN_NHAN_PHU_CAN_XOA.setdefault(key_cid, []).append(new_mid)
+        except Exception:
+            pass
+
+
+# ==============================================================================
+# 2. ĐỒNG BỘ GOOGLE SHEET SIÊU TỐC (QUÉT ĐA LUỒNG SONG SONG 4 TK)
 # ==============================================================================
 def xac_dinh_khoang_ngay_tu_preset(che_do):
     now_vn = lay_gio_viet_nam()
@@ -179,11 +355,23 @@ def xac_dinh_khoang_ngay_tu_preset(che_do):
     return hom_qua, hom_qua
 
 
+def _quet_ngay_mot_tk(tk_id, since_ymd, until_ymd):
+    url_ins = f"https://graph.facebook.com/v21.0/{tk_id}/insights"
+    params = {
+        "level": "campaign",
+        "time_increment": 1,
+        "time_range": json.dumps({"since": since_ymd, "until": until_ymd}),
+        "fields": "campaign_name,spend,actions,date_start",
+        "limit": 1000,
+        "access_token": FB_TOKEN,
+    }
+    try:
+        return HTTP.get(url_ins, params=params, timeout=20).json().get("data", [])
+    except Exception:
+        return []
+
+
 def dong_bo_khoang_ngay_len_sheet(since_ymd, until_ymd):
-    """
-    Quét dữ liệu tách theo từng ngày từ Facebook (chỉ 1 request mỗi TK),
-    sau đó gửi 1 gói Batch lên Apps Script mới để điền vào bảng 6 cột trong 0.5 giây.
-    """
     global BO_NHO_BM
     if not SHEET_WEBHOOK_URL:
         return False, "⚠️ Chưa có SHEET_WEBHOOK_URL trong GitHub Secrets."
@@ -194,44 +382,34 @@ def dong_bo_khoang_ngay_len_sheet(since_ymd, until_ymd):
     tong_theo_ngay = {}
     cum_theo_ngay = {}
 
-    for tk_idx, tk_info in BO_NHO_BM.items():
-        url_ins = f"https://graph.facebook.com/v21.0/{tk_info['id']}/insights"
-        params = {
-            "level": "campaign",
-            "time_increment": 1,
-            "time_range": json.dumps({"since": since_ymd, "until": until_ymd}),
-            "fields": "campaign_name,spend,actions,date_start",
-            "limit": 1000,
-            "access_token": FB_TOKEN,
-        }
-        try:
-            r_ins = requests.get(url_ins, params=params, timeout=20).json()
-        except Exception:
-            continue
+    # Quét song song cùng lúc tất cả tài khoản để tiết kiệm 75% thời gian
+    with ThreadPoolExecutor(max_workers=6) as executor:
+        futures = [
+            executor.submit(_quet_ngay_mot_tk, tk_info["id"], since_ymd, until_ymd)
+            for tk_info in BO_NHO_BM.values()
+        ]
+        for fut in as_completed(futures):
+            for row in fut.result():
+                spend = int(float(row.get("spend", 0)))
+                if spend <= 0:
+                    continue
+                ngay = row.get("date_start")
+                c_name = row.get("campaign_name", "Khác")
+                ten_cum = tach_ten_cum(c_name)
+                mess, cmt, _, _, _ = trich_xuat_ket_qua(row.get("actions", []))
 
-        for row in r_ins.get("data", []):
-            spend = int(float(row.get("spend", 0)))
-            if spend <= 0:
-                continue
-            ngay = row.get("date_start")
-            c_name = row.get("campaign_name", "Khác")
-            ten_cum = tach_ten_cum(c_name)
-            mess, cmt, _, _, _ = trich_xuat_ket_qua(row.get("actions", []))
+                if ngay not in tong_theo_ngay:
+                    tong_theo_ngay[ngay] = {"spend": 0, "mess": 0, "cmt": 0}
+                tong_theo_ngay[ngay]["spend"] += spend
+                tong_theo_ngay[ngay]["mess"] += mess
+                tong_theo_ngay[ngay]["cmt"] += cmt
 
-            # 1. Cộng dồn vào Tab 'Tổng'
-            if ngay not in tong_theo_ngay:
-                tong_theo_ngay[ngay] = {"spend": 0, "mess": 0, "cmt": 0}
-            tong_theo_ngay[ngay]["spend"] += spend
-            tong_theo_ngay[ngay]["mess"] += mess
-            tong_theo_ngay[ngay]["cmt"] += cmt
-
-            # 2. Cộng dồn vào Tab từng Cụm riêng biệt
-            key_cum = (ten_cum, ngay)
-            if key_cum not in cum_theo_ngay:
-                cum_theo_ngay[key_cum] = {"spend": 0, "mess": 0, "cmt": 0}
-            cum_theo_ngay[key_cum]["spend"] += spend
-            cum_theo_ngay[key_cum]["mess"] += mess
-            cum_theo_ngay[key_cum]["cmt"] += cmt
+                key_cum = (ten_cum, ngay)
+                if key_cum not in cum_theo_ngay:
+                    cum_theo_ngay[key_cum] = {"spend": 0, "mess": 0, "cmt": 0}
+                cum_theo_ngay[key_cum]["spend"] += spend
+                cum_theo_ngay[key_cum]["mess"] += mess
+                cum_theo_ngay[key_cum]["cmt"] += cmt
 
     ds_items = []
     for ngay, val in sorted(tong_theo_ngay.items()):
@@ -262,7 +440,7 @@ def dong_bo_khoang_ngay_len_sheet(since_ymd, until_ymd):
         return True, f"ℹ️ Không có phát sinh chi tiêu nào trong kỳ ({since_ymd} ➔ {until_ymd})."
 
     try:
-        r = requests.post(
+        r = HTTP.post(
             SHEET_WEBHOOK_URL,
             json={"items": ds_items},
             timeout=45,
@@ -276,7 +454,7 @@ def dong_bo_khoang_ngay_len_sheet(since_ymd, until_ymd):
                 return True, (
                     f"✅ Đã cập nhật thành công lên Google Sheet!\n"
                     f"• Kỳ dữ liệu: {since_ymd} ➔ {until_ymd} ({so_ngay} ngày có chi tiêu)\n"
-                    f"• Các Tab đã điền (6 cột chuẩn): Tổng, {', '.join(ds_cum)}"
+                    f"• Các Tab đã điền: Tổng, {', '.join(ds_cum)}"
                 )
             return False, f"⚠️ Lỗi từ Google Sheet: {js.get('message', 'Không rõ')}"
         except Exception:
@@ -292,7 +470,7 @@ def dong_bo_khoang_ngay_len_sheet(since_ymd, until_ymd):
 
 
 # ==============================================================================
-# 2. BẢNG LỊCH 7 CỘT & PHÂN TÍCH NGÀY TÙY CHỈNH (ĐẦY ĐỦ 100%)
+# 3. BẢNG LỊCH 7 CỘT & PHÂN TÍCH NGÀY TÙY CHỈNH
 # ==============================================================================
 def phan_tich_ngay_tuy_chinh(text_in):
     now_vn = lay_gio_viet_nam()
@@ -385,13 +563,13 @@ def hien_bang_lich(cid, msg_id=None, target="AUDIT", nam=None, thang=None):
         nut.append([{"text": "🔄 Chọn lại ngày khác", "callback_data": f"CAL_RESET|{target}|{nam}|{thang}"}])
         huong_dan = (
             f"✅ Đã chọn mốc đầu: {d_dep}\n"
-            f"👉 Bấm [🔍 Xem ngay 1 ngày] hoặc chạm tiếp vào ngày thứ 2 trên lịch để chọn KHOẢNG NGÀY (VD: 1/10 -> 19/10)!"
+            f"👉 Bấm [🔍 Xem ngay 1 ngày] hoặc chạm tiếp vào ngày thứ 2 trên lịch để chọn KHOẢNG NGÀY!"
         )
     else:
         huong_dan = (
             "👉 Chạm vào 1 ngày trên lịch để chọn Ngày bắt đầu.\n"
             "• Xem 1 ngày: Chạm ngày đó ➔ Bấm [🔍 Xem ngay].\n"
-            "• Xem & Đồng bộ nhiều ngày: Chạm ngày đầu ➔ Chạm tiếp ngày cuối."
+            "• Xem nhiều ngày: Chạm ngày đầu ➔ Chạm tiếp ngày cuối."
         )
 
     nut.append([{"text": "⬅️ Quay lại", "callback_data": "MENU_AUDIT"}])
@@ -399,7 +577,7 @@ def hien_bang_lich(cid, msg_id=None, target="AUDIT", nam=None, thang=None):
 
 
 # ==============================================================================
-# 3. QUÉT DỮ LIỆU FACEBOOK 5 TẦNG & AI KÉP (GEMINI + CHATGPT)
+# 4. QUÉT DỮ LIỆU FACEBOOK ĐA LUỒNG & AI BẮT BỆNH THỰC CHIẾN
 # ==============================================================================
 def trich_xuat_ket_qua(actions_list, video_thruplay_list=None):
     mess, cmt, lead, video_3s, thruplay = 0, 0, 0, 0, 0
@@ -428,7 +606,7 @@ def quet_danh_sach_tai_khoan():
         "limit": 200,
         "access_token": FB_TOKEN,
     }
-    resp = requests.get(url, params=params, timeout=20).json()
+    resp = HTTP.get(url, params=params, timeout=20).json()
     if "error" in resp:
         msg = resp["error"].get("message", "Lỗi không xác định")
         raise Exception(f"Lỗi FB Token: {msg}")
@@ -456,34 +634,49 @@ def quet_danh_sach_tai_khoan():
     return ds_tk
 
 
-def tai_du_lieu_5_tang(ma_tk, khoang_tg="today", since_date=None, until_date=None):
+def tai_du_lieu_5_tang(ma_tk, khoang_tg="today", since_date=None, until_date=None, dung_cache=True):
     if khoang_tg == "custom" and KY_TUY_CHINH and not (since_date and until_date):
         since_date, until_date = KY_TUY_CHINH[0], KY_TUY_CHINH[1]
 
-    url_camp = f"https://graph.facebook.com/v21.0/{ma_tk}/campaigns"
-    r_camp = requests.get(
-        url_camp,
-        params={"fields": "id,name,effective_status", "limit": 500, "access_token": FB_TOKEN},
-        timeout=20,
-    ).json()
-    ds_camp_goc = r_camp.get("data", []) if "error" not in r_camp else []
-    tong_so_camp = len(ds_camp_goc)
-    so_camp_active = sum(1 for c in ds_camp_goc if c.get("effective_status") == "ACTIVE")
-    trang_thai_camp = {c["id"]: ("🟢 Đang bật" if c.get("effective_status") == "ACTIVE" else "⚪ Đã tắt") for c in ds_camp_goc}
+    cache_key = (ma_tk, khoang_tg, since_date or "", until_date or "")
+    if dung_cache and cache_key in CACHE_INSIGHTS:
+        ts, cached_val = CACHE_INSIGHTS[cache_key]
+        if time.time() - ts <= THOI_GIAN_CACHE_GIAY:
+            return cached_val
 
+    url_camp = f"https://graph.facebook.com/v21.0/{ma_tk}/campaigns"
     url_ins = f"https://graph.facebook.com/v21.0/{ma_tk}/insights"
-    params = {
+
+    params_camp = {"fields": "id,name,effective_status", "limit": 500, "access_token": FB_TOKEN}
+    params_ins = {
         "level": "ad",
         "fields": "campaign_id,campaign_name,adset_id,adset_name,ad_id,ad_name,spend,reach,impressions,frequency,cpm,clicks,ctr,cpc,actions,video_thruplay_watched_actions",
         "limit": 500,
         "access_token": FB_TOKEN,
     }
     if since_date and until_date:
-        params["time_range"] = json.dumps({"since": since_date, "until": until_date})
+        params_ins["time_range"] = json.dumps({"since": since_date, "until": until_date})
     else:
-        params["date_preset"] = khoang_tg if khoang_tg != "custom" else "today"
+        params_ins["date_preset"] = khoang_tg if khoang_tg != "custom" else "today"
 
-    r_ins = requests.get(url_ins, params=params, timeout=25).json()
+    # Gọi song song API Campaigns và API Insights cùng lúc
+    with ThreadPoolExecutor(max_workers=2) as ex:
+        f_camp = ex.submit(HTTP.get, url_camp, params=params_camp, timeout=20)
+        f_ins = ex.submit(HTTP.get, url_ins, params=params_ins, timeout=25)
+        try:
+            r_camp = f_camp.result().json()
+        except Exception:
+            r_camp = {}
+        try:
+            r_ins = f_ins.result().json()
+        except Exception:
+            r_ins = {}
+
+    ds_camp_goc = r_camp.get("data", []) if "error" not in r_camp else []
+    tong_so_camp = len(ds_camp_goc)
+    so_camp_active = sum(1 for c in ds_camp_goc if c.get("effective_status") == "ACTIVE")
+    trang_thai_camp = {c["id"]: ("🟢 Đang bật" if c.get("effective_status") == "ACTIVE" else "⚪ Đã tắt") for c in ds_camp_goc}
+
     camps_raw = {}
     tong_tien_tk, tong_mess_tk = 0, 0
 
@@ -557,7 +750,7 @@ def tai_du_lieu_5_tang(ma_tk, khoang_tg="today", since_date=None, until_date=Non
 
     cum_list = gom_cum_chien_dich(camps_list)
 
-    return {
+    ket_qua = {
         "tong_so_camp": tong_so_camp,
         "so_camp_active": so_camp_active,
         "so_camp_co_tieu_tien": len(camps_list),
@@ -567,6 +760,8 @@ def tai_du_lieu_5_tang(ma_tk, khoang_tg="today", since_date=None, until_date=Non
         "cum_list": cum_list,
         "thoi_diem_cap_nhat": lay_gio_viet_nam().strftime("%H:%M - %d/%m/%Y"),
     }
+    CACHE_INSIGHTS[cache_key] = (time.time(), ket_qua)
+    return ket_qua
 
 
 def tinh_chi_so_phu(item):
@@ -587,6 +782,31 @@ def tinh_chi_so_phu(item):
     return ctr, cpm, freq, cr_mess, hook_rate, hold_rate
 
 
+def tao_du_lieu_3_tang_cho_ai(du_lieu_tk):
+    lines = []
+    for c_gr in du_lieu_tk.get("cum_list", []):
+        g_cum = int(c_gr["chi_tieu"] / c_gr["tin_nhan"]) if c_gr["tin_nhan"] > 0 else 0
+        ctr_c, cpm_c, _, cr_c, _, _ = tinh_chi_so_phu(c_gr)
+        lines.append(
+            f"CỤM [{c_gr['ten_cum']}]: Chi {c_gr['chi_tieu']:,}đ | {c_gr['tin_nhan']} mess ({g_cum:,}đ/m) | {c_gr['binh_luan']} cmt | CPM:{int(cpm_c/1000)}k | CTR:{ctr_c}% | CR:{cr_c}%"
+        )
+        for camp in c_gr.get("ds_camps", []):
+            g_camp = int(camp["chi_tieu"] / camp["tin_nhan"]) if camp["tin_nhan"] > 0 else 0
+            ctr_cp, cpm_cp, freq_cp, cr_cp, hook_cp, hold_cp = tinh_chi_so_phu(camp)
+            vid_cp = f" | Hook3s:{hook_cp}% | Hold:{hold_cp}%" if hook_cp > 0 else ""
+            lines.append(
+                f"  - Camp [{camp['ten']}] ({camp['trang_thai']}): {camp['chi_tieu']:,}đ -> {camp['tin_nhan']}m ({g_camp:,}đ/m) | CPM:{int(cpm_cp/1000)}k | CTR:{ctr_cp}% | CR:{cr_cp}% | Tần suất:{freq_cp}{vid_cp}"
+            )
+            for grp in camp.get("groups_list", []):
+                g_grp = int(grp["chi_tieu"] / grp["tin_nhan"]) if grp["tin_nhan"] > 0 else 0
+                ctr_g, cpm_g, _, cr_g, hook_g, hold_g = tinh_chi_so_phu(grp)
+                vid_g = f" | Hook3s:{hook_g}%-Hold:{hold_g}%" if hook_g > 0 else ""
+                lines.append(
+                    f"     + Nhóm [{grp['ten']}]: {grp['chi_tieu']:,}đ -> {grp['tin_nhan']}m ({g_grp:,}đ/m) [CPM:{int(cpm_g/1000)}k | CTR:{ctr_g}% | CR:{cr_g}%{vid_g}]"
+                )
+    return "\n".join(lines)
+
+
 def rà_soat_chi_tieu_bm(che_do="this_month", since_date=None, until_date=None, nhan_hien_thi=""):
     global BO_NHO_BM, BO_NHO_AUDIT
     if not BO_NHO_BM:
@@ -596,8 +816,22 @@ def rà_soat_chi_tieu_bm(che_do="this_month", since_date=None, until_date=None, 
     tong_chi_bm, tong_mess_bm, tong_cmt_bm = 0, 0, 0
     ds_ket_qua = []
 
+    # Quét song song tất cả tài khoản cùng lúc
+    ket_qua_tk = {}
+    with ThreadPoolExecutor(max_workers=6) as executor:
+        f_map = {
+            executor.submit(tai_du_lieu_5_tang, tk_info["id"], che_do, since_date, until_date): tk_idx
+            for tk_idx, tk_info in BO_NHO_BM.items()
+        }
+        for fut in as_completed(f_map):
+            tk_idx = f_map[fut]
+            try:
+                ket_qua_tk[tk_idx] = fut.result()
+            except Exception:
+                pass
+
     for tk_idx, tk_info in BO_NHO_BM.items():
-        du_lieu_tk = tai_du_lieu_5_tang(tk_info["id"], khoang_tg=che_do, since_date=since_date, until_date=until_date)
+        du_lieu_tk = ket_qua_tk.get(tk_idx) or tai_du_lieu_5_tang(tk_info["id"], che_do, since_date, until_date)
         spend = du_lieu_tk["tong_tien_tk"]
         mess = du_lieu_tk["tong_mess_tk"]
         cmt = sum(c["binh_luan"] for c in du_lieu_tk["camps_list"])
@@ -642,7 +876,7 @@ def rà_soat_chi_tieu_bm(che_do="this_month", since_date=None, until_date=None, 
             tong_cp_tk = item["spend"] + thue_tk
             lines.append(
                 f"{idx}. {item['icon']} {item['ten']}\n"
-                f"   • QC: {item['spend']:,}đ + Thuế: {thue_tk:,}đ ➔ Tổng chi phí: {tong_cp_tk:,}đ\n"
+                f"   • QC: {item['spend']:,}đ + Thuế: {thue_tk:,}đ ➔ Tổng: {tong_cp_tk:,}đ\n"
                 f"   • KQ: {item['mess']} mess ({dinh_dang_tien_gon(gia_m)}/m) | {item['cmt']} cmt"
             )
             for c_gr in item["cum_list"]:
@@ -652,7 +886,7 @@ def rà_soat_chi_tieu_bm(che_do="this_month", since_date=None, until_date=None, 
                 )
 
             hang_nut_tk.append({
-                "text": f"📂 Nhóm: {rut_gon_ten_tk(item['ten'])}",
+                "text": f"📂 Nhóm & AI: {rut_gon_ten_tk(item['ten'])}",
                 "callback_data": f"AUDIT_TK|{item['tk_idx']}",
             })
             if len(hang_nut_tk) == 2:
@@ -665,6 +899,10 @@ def rà_soat_chi_tieu_bm(che_do="this_month", since_date=None, until_date=None, 
         nut_xem_nhom.append(hang_nut_tk)
 
     lines.append("━━━━━━━━━━━━━━━━━━━━")
+    if tong_chi_bm > 0:
+        nut_xem_nhom.append([
+            {"text": f"⚡ AI Bắt Bệnh Toàn BM ({nhan_hien_thi})", "callback_data": f"AI_ALL_AUDIT|{che_do}"},
+        ])
     nut_xem_nhom.append([
         {"text": f"📊 Đẩy Kỳ Này Lên Sheet ({nhan_hien_thi})", "callback_data": f"SYNC_SHEET|{che_do}"},
     ])
@@ -690,7 +928,7 @@ def tao_bang_chi_tiet_nhom_audit(tk_idx):
     lines = [
         f"📂 CHI TIẾT NHÓM (ADSET) - {ten_tk}",
         f"📅 Kỳ: {nhan_tg}",
-        f"💰 QC: {tong_tien_tk:,}đ + Thuế ({THUE_VAT_FB}%): {thue_tk:,}đ ➔ Tổng chi phí: {tong_tien_tk + thue_tk:,}đ",
+        f"💰 QC: {tong_tien_tk:,}đ + Thuế ({THUE_VAT_FB}%): {thue_tk:,}đ ➔ Tổng: {tong_tien_tk + thue_tk:,}đ",
         "━━━━━━━━━━━━━━━━━━━━",
     ]
     for c_idx, camp in enumerate(du_lieu["camps_list"], 1):
@@ -719,7 +957,7 @@ def tao_bang_chi_tiet_nhom_audit(tk_idx):
     return "\n".join(lines), nut_bam
 
 
-def tao_bang_so_sanh_text(tieu_de, ds_items, tong_tien_cha, che_do_gon=True):
+def tao_bang_so_sanh_text(tieu_de, ds_items, tong_tien_cha):
     ds_sap_xep = sorted(ds_items, key=lambda x: (x["tin_nhan"], x["chi_tieu"]), reverse=True)
     lines = [f"📊 {tieu_de}", "━━━━━━━━━━━━━━━━━━━━"]
     for idx, item in enumerate(ds_sap_xep, 1):
@@ -738,7 +976,7 @@ def tao_bang_so_sanh_text(tieu_de, ds_items, tong_tien_cha, che_do_gon=True):
     return "\n".join(lines)
 
 
-def tao_bang_gom_cum_text(ten_tk, cum_list, tong_tien_tk, chi_tiet_cho_ai=False):
+def tao_bang_gom_cum_text(ten_tk, cum_list, tong_tien_tk):
     lines = [f"📦 TỔNG HỢP THEO CỤM ({ten_tk})", "━━━━━━━━━━━━━━━━━━━━"]
     for c_group in cum_list:
         ten_cum = c_group["ten_cum"]
@@ -754,33 +992,38 @@ def tao_bang_gom_cum_text(ten_tk, cum_list, tong_tien_tk, chi_tiet_cho_ai=False)
 
 
 def tim_model_gemini():
+    global DANH_SACH_MODEL_GEMINI
+    if DANH_SACH_MODEL_GEMINI:
+        return DANH_SACH_MODEL_GEMINI
     try:
-        res = requests.get(f"https://generativelanguage.googleapis.com/v1beta/models?key={GEMINI_KEY}", timeout=10).json()
+        res = HTTP.get(f"https://generativelanguage.googleapis.com/v1beta/models?key={GEMINI_KEY}", timeout=8).json()
         ds = [
             m.get("name", "")
             for m in res.get("models", [])
             if "generateContent" in m.get("supportedGenerationMethods", []) and "gemini" in m.get("name", "")
         ]
         if ds:
+            DANH_SACH_MODEL_GEMINI = ds
             return ds
     except Exception:
         pass
-    return ["models/gemini-2.5-flash-lite", "models/gemini-2.0-flash"]
+    DANH_SACH_MODEL_GEMINI = ["models/gemini-2.5-flash-lite", "models/gemini-2.0-flash"]
+    return DANH_SACH_MODEL_GEMINI
 
 
 def goi_gemini_api(prompt_text):
     if not GEMINI_KEY:
         return None
-    payload = {"contents": [{"parts": [{"text": prompt_text}]}], "generationConfig": {"temperature": 0.2}}
+    payload = {"contents": [{"parts": [{"text": prompt_text}]}], "generationConfig": {"temperature": 0.15}}
     for m in tim_model_gemini():
         try:
-            r = requests.post(
+            r = HTTP.post(
                 f"https://generativelanguage.googleapis.com/v1beta/{m}:generateContent?key={GEMINI_KEY}",
                 json=payload,
                 timeout=20,
             ).json()
             if "candidates" in r:
-                return f"✨ [Phân tích bởi Gemini]\n\n{r['candidates'][0]['content']['parts'][0]['text']}"
+                return f"✨ [AI BẮT BỆNH THỰC CHIẾN - GEMINI]\n━━━━━━━━━━━━━━━━━━━━\n{r['candidates'][0]['content']['parts'][0]['text']}"
         except Exception:
             continue
     return None
@@ -790,21 +1033,24 @@ def goi_openai_gpt(prompt_text):
     if not OPENAI_KEY:
         return None
     try:
-        res = requests.post(
+        res = HTTP.post(
             "https://api.openai.com/v1/chat/completions",
             headers={"Authorization": f"Bearer {OPENAI_KEY}", "Content-Type": "application/json"},
             json={
                 "model": "gpt-4o-mini",
                 "messages": [
-                    {"role": "system", "content": "Bạn là Giám đốc Tối ưu Quảng cáo Facebook (Senior Media Buyer)."},
+                    {
+                        "role": "system",
+                        "content": "Bạn là Giám đốc Tối ưu Ads thực chiến. Chỉ nói thẳng vào số liệu, tên chiến dịch/nhóm và lệnh hành động. Cấm tuyệt đối câu chào hỏi hay văn vở lý thuyết.",
+                    },
                     {"role": "user", "content": prompt_text},
                 ],
-                "temperature": 0.2,
+                "temperature": 0.15,
             },
             timeout=25,
         ).json()
         if "choices" in res and len(res["choices"]) > 0:
-            return f"🤖 [Phân tích bởi ChatGPT]\n\n{res['choices'][0]['message']['content']}"
+            return f"🤖 [AI BẮT BỆNH THỰC CHIẾN - CHATGPT]\n━━━━━━━━━━━━━━━━━━━━\n{res['choices'][0]['message']['content']}"
     except Exception:
         pass
     return None
@@ -812,13 +1058,22 @@ def goi_openai_gpt(prompt_text):
 
 def gemini_danh_gia_chuyen_sau(tieu_de, du_lieu_text, chon_ai=None):
     prompt = (
-        f"Bạn là Senior Media Buyer. Đánh giá ngắn gọn dữ liệu [{tieu_de}] (KPI: {KPI_MESS:,}đ/mess):\n"
+        f"Phân tích dữ liệu Ads thực chiến [{tieu_de}] (KPI chuẩn: <= {KPI_MESS:,}đ/mess):\n"
         f"{du_lieu_text}\n\n"
-        f"Trình bày đúng 3 mục:\n"
-        f"🟢 1. VÌ SAO TỐT (MỤC HIỆU QUẢ)\n"
-        f"🔴 2. VÌ SAO CHƯA TỐT (Chỉ rõ lỗi tại 3s đầu Video, Giữ chân Video, Hình ảnh, Tệp hay Kịch bản chat)\n"
-        f"💡 3. ĐỀ XUẤT HÀNH ĐỘNG NGAY (Tắt/Tăng vốn mục nào).\n"
-        f"Không dùng dấu sao (*) hay dấu thăng (#)."
+        f"QUY TẮC BẮT BUỘC:\n"
+        f"- CẤM văn vở mở bài/kết bài, CẤM dùng dấu sao (*) hoặc dấu thăng (#).\n"
+        f"- Đi thẳng vào gạch đầu dòng ngắn gọn, nêu đích danh Tên Cụm/Camp/Nhóm kèm con số cụ thể:\n\n"
+        f"🟢 1. ĐIỂM SÁNG HIỆU QUẢ (ĐẠT KPI <= {KPI_MESS:,}đ/m):\n"
+        f"• Chỉ rõ Cụm/Camp/Nhóm nào đang gánh team (nêu Tiền, số Mess, Giá/Mess, CTR, CR) ➔ Khuyến nghị giữ hoặc tăng bao nhiêu % vốn.\n\n"
+        f"🔴 2. BẮT BỆNH CỤM / CAMP ĐẮT HOẶC 0 MESS (CHỈ RÕ NGUYÊN NHÂN SỐ LIỆU):\n"
+        f"• Nêu tên Camp/Nhóm lỗ hoặc vượt KPI, chẩn đoán chính xác nguyên nhân dựa trên chỉ số:\n"
+        f"  + Nếu CTR < 1.2% hoặc Hook3s < 20%: Lỗi 3 giây đầu video / ảnh thumb không hút.\n"
+        f"  + Nếu CTR cao (> 2%) nhưng CR nhắn tin thấp (< 10%): Khách có bấm vào nhưng kịch bản câu chào tự động chưa chốt được inbox.\n"
+        f"  + Nếu CPM quá đắt (> 120k) hoặc Tần suất cao: Tệp hẹp hoặc bão hòa nội dung.\n\n"
+        f"⚡ 3. CHỐT LỆNH HÀNH ĐỘNG NGAY:\n"
+        f"• TẮT NGAY: [Liệt kê tên Camp/Nhóm cần tắt + số tiền tiết kiệm được].\n"
+        f"• TĂNG VỐN / NHÂN NHÓM: [Liệt kê tên Camp/Nhóm cần dồn ngân sách].\n"
+        f"• SỬA CONTENT / KỊCH BẢN CHAT: [Ghi 1 dòng ngắn gọn]."
     )
     if (chon_ai or AI_UU_TIEN) == "chatgpt":
         return goi_openai_gpt(prompt) or goi_gemini_api(prompt) or "⚠️ Không kết nối được AI."
@@ -826,43 +1081,8 @@ def gemini_danh_gia_chuyen_sau(tieu_de, du_lieu_text, chon_ai=None):
 
 
 # ==============================================================================
-# 4. GIAO DIỆN 4 LUỒNG & ĐIỀU HƯỚNG TELEGRAM
+# 5. GIAO DIỆN 4 LUỒNG CHÍNH (HIỂN THỊ TRÊN 1 TIN NHẮN DUY NHẤT)
 # ==============================================================================
-def gui_ban_phim_co_dinh(chat_id, loi_nhan="⌨️ Đã bật Thanh Điều Hướng 4 Luồng dưới đáy màn hình!"):
-    requests.post(
-        f"https://api.telegram.org/bot{TELE_TOKEN}/sendMessage",
-        json={"chat_id": chat_id, "text": loi_nhan, "reply_markup": BAN_PHIM_CO_DINH},
-    )
-
-
-def gui_hoac_sua_menu(chat_id, van_ban, nut_bam=None, msg_id=None):
-    if msg_id and len(van_ban) <= 3800:
-        payload = {"chat_id": chat_id, "message_id": msg_id, "text": van_ban}
-        if nut_bam:
-            payload["reply_markup"] = {"inline_keyboard": nut_bam}
-        r = requests.post(f"https://api.telegram.org/bot{TELE_TOKEN}/editMessageText", json=payload).json()
-        if r.get("ok"):
-            return
-
-    url = f"https://api.telegram.org/bot{TELE_TOKEN}/sendMessage"
-    cac_dong = van_ban.split("\n")
-    doan, cac_phan = "", []
-    for dong in cac_dong:
-        if len(doan) + len(dong) + 1 > 3800:
-            cac_phan.append(doan)
-            doan = dong + "\n"
-        else:
-            doan += dong + "\n"
-    if doan.strip():
-        cac_phan.append(doan)
-
-    for idx, p in enumerate(cac_phan):
-        payload = {"chat_id": chat_id, "text": p}
-        if idx == len(cac_phan) - 1:
-            payload["reply_markup"] = {"inline_keyboard": nut_bam} if nut_bam else BAN_PHIM_CO_DINH
-        requests.post(url, json=payload)
-
-
 def tao_khung_thoi_gian_chuan(prefix_cmd, tg_hien_tai=None, target_lich="AUDIT"):
     hang_1 = [
         {"text": f"✅{n}" if tg_hien_tai == m else n, "callback_data": f"{prefix_cmd}|{m}"}
@@ -893,7 +1113,7 @@ def hien_luong_1_ds_tai_khoan(cid, msg_id=None, tg_mac_dinh="today"):
         f"💳 DANH SÁCH TÀI KHOẢN QUẢNG CÁO\n"
         f"🕒 {lay_gio_viet_nam().strftime('%H:%M - %d/%m/%Y')} | 🧾 VAT: {THUE_VAT_FB}%\n"
         f"━━━━━━━━━━━━━━━━━━━━\n{ds}\n━━━━━━━━━━━━━━━━━━━━\n"
-        f"👇 Chạm vào Tài khoản để xem số liệu:"
+        f"👇 Chạm vào Tài khoản để xem số liệu & AI bắt bệnh:"
     )
     gui_hoac_sua_menu(cid, van_ban, nut, msg_id)
 
@@ -902,7 +1122,7 @@ def hien_luong_2_bao_cao_tong(cid, msg_id=None):
     van_ban = (
         "📊 BÁO CÁO TỔNG & AI BẮT BỆNH (4 TÀI KHOẢN)\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
-        "Chọn khung thời gian để xuất báo cáo tổng hợp và đồng bộ vào Google Sheet:"
+        "Chọn khung thời gian để xuất báo cáo thực chiến và tự động đồng bộ vào Google Sheet:"
     )
     nut = tao_khung_thoi_gian_chuan("QuickReport", None, "REPORT")
     nut.append([{"text": "📥 Điền Cả Tháng Này Vào Sheet (1 -> Nay)", "callback_data": "SYNC_SHEET|this_month"}])
@@ -988,14 +1208,19 @@ def hien_man_hinh_tai_khoan(cid, tk_idx, tg="today", msg_id=None, can_tai_lai=Tr
                 hang_c = []
         if hang_c:
             nut.append(hang_c)
+
+        nut.append([
+            {"text": "✨ Gemini Bắt Bệnh TK Này", "callback_data": f"AI_TK|{tk_idx}|gemini"},
+            {"text": "🤖 ChatGPT Bắt Bệnh TK Này", "callback_data": f"AI_TK|{tk_idx}|chatgpt"},
+        ])
     nut.append([{"text": "💳 Đổi Tài Khoản", "callback_data": "MENU_ACCOUNTS"}])
     gui_hoac_sua_menu(cid, tom_tat, nut, msg_id)
 
 
 # ==============================================================================
-# 5. BÁO CÁO ĐỊNH KỲ 8H SÁNG (TỰ ĐỘNG BÁO TELEGRAM + CẬP NHẬT GOOGLE SHEET)
+# 6. BÁO CÁO ĐỊNH KỲ 8H SÁNG & BÁO CÁO TỔNG KÈM AI THỰC CHIẾN
 # ==============================================================================
-def chay_bao_cao_tu_dong(khoang_tg="yesterday", la_tu_dong_dinh_ky=False, since_date=None, until_date=None, nhan_tuy_chinh=None):
+def chay_bao_cao_tu_dong(khoang_tg="yesterday", la_tu_dong_dinh_ky=False, since_date=None, until_date=None, nhan_tuy_chinh=None, msg_id=None):
     global BO_NHO_BM
     BO_NHO_BM = quet_danh_sach_tai_khoan()
 
@@ -1003,41 +1228,90 @@ def chay_bao_cao_tu_dong(khoang_tg="yesterday", la_tu_dong_dinh_ky=False, since_
         since_date, until_date = xac_dinh_khoang_ngay_tu_preset(khoang_tg)
 
     ten_ky = nhan_tuy_chinh or lay_nhan_ky_du_lieu(khoang_tg)
-    tieu_de_buoi = f"☀️ BÁO CÁO 8H SÁNG & ĐỒNG BỘ SHEET ({ten_ky})" if la_tu_dong_dinh_ky else f"📊 BÁO CÁO TỔNG ({ten_ky})"
+    tieu_de_buoi = f"☀️ BÁO CÁO 8H SÁNG & ĐỒNG BỘ SHEET ({ten_ky})" if la_tu_dong_dinh_ky else f"📊 BÁO CÁO TỔNG & AI THỰC CHIẾN ({ten_ky})"
 
-    co_tk_tieu_tien = False
+    # Quét song song dữ liệu 5 tầng của 4 TK VÀ đồng bộ Google Sheet cùng lúc
+    ket_qua_tk = {}
+    with ThreadPoolExecutor(max_workers=6) as executor:
+        f_sheet = executor.submit(dong_bo_khoang_ngay_len_sheet, since_date, until_date)
+        f_map = {
+            executor.submit(tai_du_lieu_5_tang, tk_info["id"], khoang_tg, since_date, until_date): tk_idx
+            for tk_idx, tk_info in BO_NHO_BM.items()
+        }
+        for fut in as_completed(f_map):
+            tk_idx = f_map[fut]
+            try:
+                ket_qua_tk[tk_idx] = fut.result()
+            except Exception:
+                pass
+        _, msg_sheet = f_sheet.result()
+
+    tong_qc_bm, tong_mess_bm = 0, 0
+    cac_khoi_tk = []
+    du_lieu_ai_toan_bm = []
+
     for tk_idx, tk_info in BO_NHO_BM.items():
-        du_lieu = tai_du_lieu_5_tang(tk_info["id"], khoang_tg, since_date, until_date)
+        du_lieu = ket_qua_tk.get(tk_idx) or tai_du_lieu_5_tang(tk_info["id"], khoang_tg, since_date, until_date)
         if du_lieu["so_camp_co_tieu_tien"] > 0:
-            co_tk_tieu_tien = True
             tong_qc = du_lieu["tong_tien_tk"]
             thue_tk = int(tong_qc * (THUE_VAT_FB / 100.0))
             tong_cp = tong_qc + thue_tk
             gia_tb = int(tong_qc / du_lieu["tong_mess_tk"]) if du_lieu["tong_mess_tk"] > 0 else 0
 
+            tong_qc_bm += tong_qc
+            tong_mess_bm += du_lieu["tong_mess_tk"]
+
             bang_gon = tao_bang_gom_cum_text(tk_info["ten"], du_lieu["cum_list"], tong_qc)
-            nhan_xet = gemini_danh_gia_chuyen_sau(f"{tk_info['ten']} ({ten_ky})", bang_gon)
-            mo_dau = (
-                f"{tieu_de_buoi}\n"
-                f"💳 TK: {tk_info['ten']}\n"
-                f"🔥 Chi phí QC: {tong_qc:,}đ | 🧾 Thuế ({THUE_VAT_FB}%): +{thue_tk:,}đ\n"
-                f"💰 TỔNG CHI PHÍ: {tong_cp:,}đ | 💬 {du_lieu['tong_mess_tk']} mess ({gia_tb:,}đ/m)\n\n"
-            )
-            gui_hoac_sua_menu(CHAT_ID, mo_dau + bang_gon + "\n\n" + nhan_xet)
+            chi_tiet_3_tang = tao_du_lieu_3_tang_cho_ai(du_lieu)
+            du_lieu_ai_toan_bm.append(f"=== TÀI KHOẢN: {tk_info['ten']} ===\n{chi_tiet_3_tang}")
 
-    if not co_tk_tieu_tien:
-        gui_hoac_sua_menu(CHAT_ID, f"{tieu_de_buoi}\nℹ️ Chưa có tài khoản nào phát sinh chi tiêu trong kỳ [{ten_ky}].")
+            if la_tu_dong_dinh_ky:
+                nhan_xet_tk = gemini_danh_gia_chuyen_sau(f"{tk_info['ten']} ({ten_ky})", chi_tiet_3_tang)
+                mo_dau = (
+                    f"{tieu_de_buoi}\n"
+                    f"💳 TK: {tk_info['ten']}\n"
+                    f"🔥 Chi phí QC: {tong_qc:,}đ | 🧾 Thuế ({THUE_VAT_FB}%): +{thue_tk:,}đ\n"
+                    f"💰 TỔNG CHI PHÍ: {tong_cp:,}đ | 💬 {du_lieu['tong_mess_tk']} mess ({gia_tb:,}đ/m)\n\n"
+                )
+                gui_hoac_sua_menu(CHAT_ID, mo_dau + bang_gon + "\n\n" + nhan_xet_tk, giu_co_dinh=True)
+            else:
+                cac_khoi_tk.append(
+                    f"💳 {tk_info['ten']}: QC {tong_qc:,}đ + Thuế {thue_tk:,}đ ➔ Tổng {tong_cp:,}đ | 💬 {du_lieu['tong_mess_tk']}m ({gia_tb:,}đ/m)\n{bang_gon}"
+                )
 
-    # Đẩy dữ liệu vào bảng 6 cột trên Google Sheet
-    _, msg_sheet = dong_bo_khoang_ngay_len_sheet(since_date, until_date)
-    gui_hoac_sua_menu(CHAT_ID, msg_sheet)
+    if la_tu_dong_dinh_ky:
+        if tong_qc_bm == 0:
+            gui_hoac_sua_menu(CHAT_ID, f"{tieu_de_buoi}\nℹ️ Chưa có tài khoản nào phát sinh chi tiêu trong kỳ [{ten_ky}].", giu_co_dinh=True)
+        gui_hoac_sua_menu(CHAT_ID, msg_sheet, giu_co_dinh=True)
+        return
+
+    nut_quay_lai = [
+        [{"text": "📊 Đổi Khung Thời Gian Báo Cáo", "callback_data": "MENU_REPORT"}],
+        [{"text": "💰 Sang Rà Soát Ngân Sách", "callback_data": "MENU_AUDIT"}, {"text": "💳 DS Tài Khoản", "callback_data": "MENU_ACCOUNTS"}],
+    ]
+    if tong_qc_bm == 0:
+        gui_hoac_sua_menu(CHAT_ID, f"{tieu_de_buoi}\nℹ️ Chưa có phát sinh chi tiêu trong kỳ [{ten_ky}].\n\n{msg_sheet}", nut_quay_lai, msg_id)
+        return
+
+    thue_bm = int(tong_qc_bm * (THUE_VAT_FB / 100.0))
+    nhan_xet_chung = gemini_danh_gia_chuyen_sau(f"Toàn bộ tài khoản ({ten_ky})", "\n\n".join(du_lieu_ai_toan_bm))
+    noi_dung_gop = (
+        f"{tieu_de_buoi}\n"
+        f"🔥 Tổng QC: {tong_qc_bm:,}đ + Thuế: {thue_bm:,}đ ➔ Tổng: {tong_qc_bm + thue_bm:,}đ | 💬 {tong_mess_bm} mess\n"
+        f"{msg_sheet}\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n\n"
+        + "\n\n".join(cac_khoi_tk)
+        + "\n\n"
+        + nhan_xet_chung
+    )
+    gui_hoac_sua_menu(CHAT_ID, noi_dung_gop, nut_quay_lai, msg_id)
 
 
 def da_bao_cao_xuyen_phien(ma_ngay_gio):
     if ma_ngay_gio in DA_BAO_CAO_TRONG_PHIEN:
         return True
     try:
-        r = requests.get(f"https://api.telegram.org/bot{TELE_TOKEN}/getMyShortDescription", timeout=5).json()
+        r = HTTP.get(f"https://api.telegram.org/bot{TELE_TOKEN}/getMyShortDescription", timeout=5).json()
         if f"[DONE:{ma_ngay_gio}]" in r.get("result", {}).get("short_description", ""):
             DA_BAO_CAO_TRONG_PHIEN.add(ma_ngay_gio)
             return True
@@ -1049,7 +1323,7 @@ def da_bao_cao_xuyen_phien(ma_ngay_gio):
 def danh_dau_da_bao_cao_xuyen_phien(ma_ngay_gio):
     DA_BAO_CAO_TRONG_PHIEN.add(ma_ngay_gio)
     try:
-        requests.post(
+        HTTP.post(
             f"https://api.telegram.org/bot{TELE_TOKEN}/setMyShortDescription",
             json={"short_description": f"Trợ lý Ads 24/7 [DONE:{ma_ngay_gio}]"},
             timeout=5,
@@ -1061,7 +1335,6 @@ def danh_dau_da_bao_cao_xuyen_phien(ma_ngay_gio):
 def kiem_tra_den_gio_bao_cao_tu_dong():
     now_vn = lay_gio_viet_nam()
     ma_ngay_gio = now_vn.strftime("%Y-%m-%d_%H")
-    # Đúng 8h sáng mỗi ngày: Tự báo cáo số liệu Hôm qua + Tự cập nhật vào Google Sheet
     if now_vn.hour == GIO_BAO_CAO_SANG and now_vn.minute <= 20:
         if not da_bao_cao_xuyen_phien(ma_ngay_gio):
             danh_dau_da_bao_cao_xuyen_phien(ma_ngay_gio)
@@ -1076,7 +1349,7 @@ def xu_ly_ket_qua_chon_lich(cid, msg_id, target):
         gui_hoac_sua_menu(cid, bc, nut, msg_id)
     elif target == "REPORT":
         gui_hoac_sua_menu(cid, f"⏳ Đang xuất Báo Cáo Tổng & đồng bộ Sheet [{nhan_d}]...", None, msg_id)
-        chay_bao_cao_tu_dong("custom", False, since_d, until_d, nhan_d)
+        chay_bao_cao_tu_dong("custom", False, since_d, until_d, nhan_d, msg_id=msg_id)
     elif target.startswith("TK_"):
         tk_idx = target.split("_")[1]
         hien_man_hinh_tai_khoan(cid, tk_idx, "custom", msg_id)
@@ -1085,18 +1358,18 @@ def xu_ly_ket_qua_chon_lich(cid, msg_id, target):
 
 
 # ==============================================================================
-# 6. VÒNG LẶP TRỰC CHIẾN 24/7
+# 7. VÒNG LẶP TRỰC CHIẾN 24/7 SIÊU TỐC
 # ==============================================================================
 def chay_vong_lap_truc_chien_247(offset_ban_dau=0):
     global AI_UU_TIEN, KY_TUY_CHINH
     offset = offset_ban_dau
     thoi_diem_bat_dau = time.time()
-    print("🟢 Bot đang trực chiến 24/7 (Bản Full chuẩn 6 cột Google Sheet)...")
+    print("🟢 Bot đang trực chiến 24/7 (Bản Tối Ưu Đa Luồng Siêu Tốc)...")
 
     while time.time() - thoi_diem_bat_dau < THOI_GIAN_DUY_TRI_PHIEN:
         try:
             kiem_tra_den_gio_bao_cao_tu_dong()
-            res = requests.get(
+            res = HTTP.get(
                 f"https://api.telegram.org/bot{TELE_TOKEN}/getUpdates?offset={offset}&timeout=20",
                 timeout=25,
             ).json()
@@ -1104,40 +1377,54 @@ def chay_vong_lap_truc_chien_247(offset_ban_dau=0):
             for update in res.get("result", []):
                 offset = update["update_id"] + 1
 
+                # XỬ LÝ TIN NHẮN VĂN BẢN / NÚT BẤM DƯỚI ĐÁY MÀN HÌNH
                 if "message" in update and "text" in update["message"]:
-                    cid = update["message"]["chat"]["id"]
+                    msg_obj = update["message"]
+                    cid = msg_obj["chat"]["id"]
                     if str(cid) != str(CHAT_ID):
                         continue
 
-                    text_raw = update["message"]["text"].strip()
+                    user_msg_id = msg_obj["message_id"]
+                    text_raw = msg_obj["text"].strip()
                     text_in = text_raw.lower()
+
+                    # Xóa ngay tin nhắn lệnh vừa gõ/bấm
+                    xoa_tin_nhan_an_toan(cid, user_msg_id)
+
+                    active_mid = DASHBOARD_MSG_ID.get(str(cid))
 
                     kq_ngay = phan_tich_ngay_tuy_chinh(text_raw)
                     if kq_ngay:
                         KY_TUY_CHINH = kq_ngay
-                        hien_menu_chon_luong_cho_ngay_tuy_chinh(cid)
+                        hien_menu_chon_luong_cho_ngay_tuy_chinh(cid, active_mid)
                         continue
 
                     if text_in in ["/menu", "💳 danh sách tài khoản"]:
-                        hien_luong_1_ds_tai_khoan(cid)
+                        hien_luong_1_ds_tai_khoan(cid, active_mid)
                     elif text_in in ["/baocao", "📊 báo cáo tổng (4 tk)"]:
-                        hien_luong_2_bao_cao_tong(cid)
+                        hien_luong_2_bao_cao_tong(cid, active_mid)
                     elif text_in in ["/rasoat", "💰 rà soát ngân sách"]:
-                        hien_luong_3_ra_soat_ngan_sach(cid)
+                        hien_luong_3_ra_soat_ngan_sach(cid, active_mid)
                     elif text_in in ["/congno", "🏦 công nợ & cài đặt"]:
-                        hien_luong_4_cong_no_va_cai_dat(cid)
+                        hien_luong_4_cong_no_va_cai_dat(cid, active_mid)
                     elif text_in in ["/sheet"]:
                         s_d, u_d = xac_dinh_khoang_ngay_tu_preset("this_month")
-                        gui_hoac_sua_menu(cid, f"⏳ Đang đồng bộ siêu tốc từ {s_d} đến {u_d} vào Google Sheet...")
+                        gui_hoac_sua_menu(cid, f"⏳ Đang đồng bộ đa luồng ({s_d} ➔ {u_d}) vào Google Sheet...", None, active_mid)
                         _, msg_sh = dong_bo_khoang_ngay_len_sheet(s_d, u_d)
-                        gui_hoac_sua_menu(cid, msg_sh)
+                        nut_sh = [
+                            [{"text": "💰 Về Rà Soát Ngân Sách", "callback_data": "MENU_AUDIT"}],
+                            [{"text": "💳 Về DS Tài Khoản", "callback_data": "MENU_ACCOUNTS"}],
+                        ]
+                        gui_hoac_sua_menu(cid, msg_sh, nut_sh, DASHBOARD_MSG_ID.get(str(cid)))
                     elif text_in in ["/lich"]:
                         TRANG_THAI_LICH[cid] = {"start": None}
-                        hien_bang_lich(cid, target="CUSTOM_HUB")
+                        hien_bang_lich(cid, active_mid, target="CUSTOM_HUB")
                     else:
-                        gui_ban_phim_co_dinh(cid)
-                        hien_luong_1_ds_tai_khoan(cid)
+                        if not active_mid:
+                            gui_ban_phim_co_dinh(cid)
+                        hien_luong_1_ds_tai_khoan(cid, active_mid)
 
+                # XỬ LÝ TẤT CẢ CÁC NÚT BẤM INLINE TRÊN BẢNG ĐIỀU KHIỂN
                 elif "callback_query" in update:
                     cb = update["callback_query"]
                     cid = cb["message"]["chat"]["id"]
@@ -1145,13 +1432,18 @@ def chay_vong_lap_truc_chien_247(offset_ban_dau=0):
                         continue
 
                     msg_id = cb["message"]["message_id"]
+                    DASHBOARD_MSG_ID[str(cid)] = msg_id
                     parts = cb["data"].strip().split("|")
                     lenh = parts[0]
 
-                    requests.post(
-                        f"https://api.telegram.org/bot{TELE_TOKEN}/answerCallbackQuery",
-                        json={"callback_query_id": cb["id"]},
-                    )
+                    try:
+                        HTTP.post(
+                            f"https://api.telegram.org/bot{TELE_TOKEN}/answerCallbackQuery",
+                            json={"callback_query_id": cb["id"]},
+                            timeout=3,
+                        )
+                    except Exception:
+                        pass
 
                     if lenh == "CAL_IGNORE":
                         continue
@@ -1159,7 +1451,7 @@ def chay_vong_lap_truc_chien_247(offset_ban_dau=0):
                         AI_UU_TIEN = parts[1]
                         hien_luong_4_cong_no_va_cai_dat(cid, msg_id)
                     elif lenh == "REFRESH_ALL":
-                        BO_NHO_BM.clear(); BO_NHO_TK.clear(); BO_NHO_AUDIT.clear()
+                        xoa_sach_cache()
                         hien_luong_1_ds_tai_khoan(cid, msg_id)
                     elif lenh == "CAL_OPEN":
                         TRANG_THAI_LICH[cid] = {"start": None}
@@ -1198,7 +1490,7 @@ def chay_vong_lap_truc_chien_247(offset_ban_dau=0):
                     elif lenh == "AUDIT":
                         che_do_a = parts[1]
                         ten_ky_a = lay_nhan_ky_du_lieu(che_do_a)
-                        gui_hoac_sua_menu(cid, f"⏳ Đang rà soát ngân sách [{ten_ky_a}]...", None, msg_id)
+                        gui_hoac_sua_menu(cid, f"⏳ Đang rà soát đa luồng [{ten_ky_a}]...", None, msg_id)
                         if che_do_a == "custom" and KY_TUY_CHINH:
                             bc, nut = rà_soat_chi_tieu_bm("custom", KY_TUY_CHINH[0], KY_TUY_CHINH[1], ten_ky_a)
                         else:
@@ -1215,22 +1507,80 @@ def chay_vong_lap_truc_chien_247(offset_ban_dau=0):
                         if tk_idx not in BO_NHO_AUDIT:
                             hien_luong_3_ra_soat_ngan_sach(cid, msg_id)
                             continue
+                        info_a = BO_NHO_AUDIT[tk_idx]
                         van_ban_nhom, nut_nhom = tao_bang_chi_tiet_nhom_audit(tk_idx)
-                        gui_hoac_sua_menu(cid, van_ban_nhom + "\n\n⏳ AI đang phân tích các Nhóm...", None, msg_id)
-                        nhan_xet = gemini_danh_gia_chuyen_sau(BO_NHO_AUDIT[tk_idx]["ten_tk"], van_ban_nhom, chon_ai=chon_ai)
+                        gui_hoac_sua_menu(cid, van_ban_nhom + "\n\n⏳ AI đang bóc tách số liệu từng Nhóm...", None, msg_id)
+                        du_lieu_3_tang = tao_du_lieu_3_tang_cho_ai(info_a["data"])
+                        nhan_xet = gemini_danh_gia_chuyen_sau(f"{info_a['ten_tk']} ({info_a['nhan_hien_thi']})", du_lieu_3_tang, chon_ai=chon_ai)
                         gui_hoac_sua_menu(cid, van_ban_nhom + "\n\n" + nhan_xet, nut_nhom, msg_id)
+
+                    elif lenh == "AI_ALL_AUDIT":
+                        che_do_a = parts[1]
+                        ten_ky_a = lay_nhan_ky_du_lieu(che_do_a)
+                        gui_hoac_sua_menu(cid, f"⏳ AI đang tổng hợp & bắt bệnh toàn bộ BM ({ten_ky_a})...", None, msg_id)
+                        ds_text_ai = []
+                        for tk_idx, info_a in BO_NHO_AUDIT.items():
+                            ds_text_ai.append(f"=== TK: {info_a['ten_tk']} ===\n" + tao_du_lieu_3_tang_cho_ai(info_a["data"]))
+                        nhan_xet_all = gemini_danh_gia_chuyen_sau(f"Toàn bộ BM ({ten_ky_a})", "\n\n".join(ds_text_ai))
+                        nut_back = [
+                            [
+                                {"text": "✨ Đổi sang Gemini", "callback_data": f"AI_ALL_AUDIT_MODEL|{che_do_a}|gemini"},
+                                {"text": "🤖 Đổi sang ChatGPT", "callback_data": f"AI_ALL_AUDIT_MODEL|{che_do_a}|chatgpt"},
+                            ],
+                            [{"text": f"⬅️ Quay lại Bảng Rà Soát ({ten_ky_a})", "callback_data": f"AUDIT|{che_do_a}"}],
+                        ]
+                        gui_hoac_sua_menu(cid, nhan_xet_all, nut_back, msg_id)
+
+                    elif lenh == "AI_ALL_AUDIT_MODEL":
+                        che_do_a, chon_ai = parts[1], parts[2]
+                        ten_ky_a = lay_nhan_ky_du_lieu(che_do_a)
+                        gui_hoac_sua_menu(cid, f"⏳ Đang chuyển sang {chon_ai.upper()} phân tích toàn BM ({ten_ky_a})...", None, msg_id)
+                        ds_text_ai = [f"=== TK: {info_a['ten_tk']} ===\n" + tao_du_lieu_3_tang_cho_ai(info_a["data"]) for info_a in BO_NHO_AUDIT.values()]
+                        nhan_xet_all = gemini_danh_gia_chuyen_sau(f"Toàn bộ BM ({ten_ky_a})", "\n\n".join(ds_text_ai), chon_ai=chon_ai)
+                        nut_back = [
+                            [
+                                {"text": "✨ Đổi sang Gemini", "callback_data": f"AI_ALL_AUDIT_MODEL|{che_do_a}|gemini"},
+                                {"text": "🤖 Đổi sang ChatGPT", "callback_data": f"AI_ALL_AUDIT_MODEL|{che_do_a}|chatgpt"},
+                            ],
+                            [{"text": f"⬅️ Quay lại Bảng Rà Soát ({ten_ky_a})", "callback_data": f"AUDIT|{che_do_a}"}],
+                        ]
+                        gui_hoac_sua_menu(cid, nhan_xet_all, nut_back, msg_id)
+
+                    elif lenh == "AI_TK":
+                        tk_idx = parts[1]
+                        chon_ai = parts[2] if len(parts) > 2 else None
+                        if tk_idx not in BO_NHO_TK:
+                            hien_man_hinh_tai_khoan(cid, tk_idx, "today", msg_id)
+                            continue
+                        tk_cache = BO_NHO_TK[tk_idx]
+                        ten_ky_tk = lay_nhan_ky_du_lieu(tk_cache["tg"])
+                        gui_hoac_sua_menu(cid, f"⏳ AI đang bắt bệnh thực chiến cho {tk_cache['ten_tk']} ({ten_ky_tk})...", None, msg_id)
+                        du_lieu_3_tang = tao_du_lieu_3_tang_cho_ai(tk_cache["data"])
+                        nhan_xet = gemini_danh_gia_chuyen_sau(f"{tk_cache['ten_tk']} ({ten_ky_tk})", du_lieu_3_tang, chon_ai=chon_ai)
+                        nut_back = [
+                            [
+                                {"text": "✨ Đổi sang Gemini", "callback_data": f"AI_TK|{tk_idx}|gemini"},
+                                {"text": "🤖 Đổi sang ChatGPT", "callback_data": f"AI_TK|{tk_idx}|chatgpt"},
+                            ],
+                            [{"text": "⬅️ Quay lại Tài khoản", "callback_data": f"TK|{tk_idx}|{tk_cache['tg']}"}],
+                        ]
+                        gui_hoac_sua_menu(cid, nhan_xet, nut_back, msg_id)
 
                     elif lenh == "SYNC_SHEET":
                         che_do_s = parts[1]
                         s_d, u_d = xac_dinh_khoang_ngay_tu_preset(che_do_s)
-                        gui_hoac_sua_menu(cid, f"⏳ Đang đồng bộ siêu tốc ({s_d} ➔ {u_d}) vào Google Sheet...")
+                        gui_hoac_sua_menu(cid, f"⏳ Đang đồng bộ đa luồng ({s_d} ➔ {u_d}) vào Google Sheet...", None, msg_id)
                         _, msg_sh = dong_bo_khoang_ngay_len_sheet(s_d, u_d)
-                        gui_hoac_sua_menu(cid, msg_sh)
+                        nut_sh = [
+                            [{"text": "💰 Về Rà Soát Ngân Sách", "callback_data": "MENU_AUDIT"}],
+                            [{"text": "💳 Về DS Tài Khoản", "callback_data": "MENU_ACCOUNTS"}],
+                        ]
+                        gui_hoac_sua_menu(cid, msg_sh, nut_sh, msg_id)
 
                     elif lenh == "QuickReport":
                         ky_bc = parts[1]
-                        gui_hoac_sua_menu(cid, "⏳ Đang xuất Báo Cáo Tổng & đồng bộ Google Sheet...", None, msg_id)
-                        chay_bao_cao_tu_dong(ky_bc, la_tu_dong_dinh_ky=False)
+                        gui_hoac_sua_menu(cid, "⏳ Đang quét đa luồng Báo Cáo Tổng & đồng bộ Google Sheet...", None, msg_id)
+                        chay_bao_cao_tu_dong(ky_bc, la_tu_dong_dinh_ky=False, msg_id=msg_id)
 
                     elif lenh == "TK":
                         hien_man_hinh_tai_khoan(cid, parts[1], parts[2], msg_id)
@@ -1244,19 +1594,19 @@ def chay_vong_lap_truc_chien_247(offset_ban_dau=0):
                         c_group = tk_cache["data"]["cum_list"][int(cum_idx)]
                         gui_hoac_sua_menu(
                             cid,
-                            tao_bang_so_sanh_text(f"CỤM [{c_group['ten_cum']}]", c_group["ds_camps"], c_group["chi_tieu"]),
+                            tao_bang_so_sanh_text(f"CỤM [{c_group['ten_cum']}] ({tk_cache['ten_tk']})", c_group["ds_camps"], c_group["chi_tieu"]),
                             [[{"text": "⬅️ Về Tài khoản", "callback_data": f"TK|{tk_idx}|{tk_cache['tg']}"}]],
                             msg_id,
                         )
 
         except Exception as e:
             print("⚠️ Lỗi:", e)
-            time.sleep(3)
+            time.sleep(2)
 
 
 if __name__ == "__main__":
     cai_dat_menu_lenh_telegram()
-    res_check = requests.get(f"https://api.telegram.org/bot{TELE_TOKEN}/getUpdates?timeout=2").json()
+    res_check = HTTP.get(f"https://api.telegram.org/bot{TELE_TOKEN}/getUpdates?timeout=2").json()
     updates = res_check.get("result", [])
     next_offset = updates[-1]["update_id"] + 1 if updates else 0
 
