@@ -15,7 +15,7 @@ THUE_VAT_FB = float(os.environ.get("THUE_VAT_FB") or "10.0")
 GIO_BAO_CAO_SANG = 8
 GIO_BAO_CAO_TOI = 20
 THOI_GIAN_DUY_TRI_PHIEN = 54 * 60
-THOI_GIAN_CACHE_GIAY = 90  # Giữ cache 90s để bấm chuyển tab nhanh tức thì
+THOI_GIAN_CACHE_GIAY = 90
 
 FB_TOKEN = (os.environ.get("FB_ACCESS_TOKEN") or "").strip()
 GEMINI_KEY = (os.environ.get("GEMINI_API_KEY") or "").strip()
@@ -29,26 +29,23 @@ SHEET_WEBHOOK_URL = (os.environ.get("SHEET_WEBHOOK_URL") or "").strip()
 
 AI_UU_TIEN = "gemini"
 
-# Khởi tạo Phiên kết nối liên tục (Keep-Alive Session) giúp giảm 70% độ trễ mạng
 HTTP = requests.Session()
 ADAPTER = requests.adapters.HTTPAdapter(pool_connections=20, pool_maxsize=20, max_retries=2)
 HTTP.mount("https://", ADAPTER)
 HTTP.mount("http://", ADAPTER)
 
-# Bộ nhớ đệm tốc độ cao
 BO_NHO_BM = {}
 BO_NHO_TK = {}
 BO_NHO_AUDIT = {}
-CACHE_INSIGHTS = {}          # {(ma_tk, key_tg): (timestamp, data)}
+CACHE_INSIGHTS = {}
 DANH_SACH_MODEL_GEMINI = None
 TRANG_THAI_LICH = {}
 KY_TUY_CHINH = None
 DA_BAO_CAO_TRONG_PHIEN = set()
 
-# Quản lý Giao diện Đơn Trang & Bàn phím cố định
-DASHBOARD_MSG_ID = {}        # {chat_id: message_id_chinh}
-ANCHOR_KEYBOARD_ID = {}      # {chat_id: message_id_giu_ban_phim_co_dinh}
-TIN_NHAN_PHU_CAN_XOA = {}    # {chat_id: [ds_message_id_phu]}
+DASHBOARD_MSG_ID = {}
+ANCHOR_KEYBOARD_ID = {}
+TIN_NHAN_PHU_CAN_XOA = {}
 
 NHAN_THOI_GIAN = {
     "today": "Hôm nay (Realtime)",
@@ -198,10 +195,6 @@ def don_dep_tin_nhan_phu(chat_id):
 
 
 def gui_ban_phim_co_dinh(chat_id, loi_nhan="⌨️ Thanh điều hướng 4 luồng đang bật sẵn bên dưới 👇"):
-    """
-    Gửi tin nhắn neo giữ Bàn phím cố định 4 nút dưới đáy màn hình.
-    TUYỆT ĐỐI KHÔNG tự xóa tin nhắn này để Telegram không bao giờ ẩn bàn phím.
-    """
     key_cid = str(chat_id)
     old_anchor = ANCHOR_KEYBOARD_ID.get(key_cid)
     if old_anchor:
@@ -225,7 +218,6 @@ def gui_ban_phim_co_dinh(chat_id, loi_nhan="⌨️ Thanh điều hướng 4 lu�
 def gui_hoac_sua_menu(chat_id, van_ban, nut_bam=None, msg_id=None, giu_co_dinh=False):
     key_cid = str(chat_id)
 
-    # 1. Nếu là Báo cáo 8h sáng cố định -> Gửi tin nhắn độc lập để lưu lịch sử
     if giu_co_dinh:
         url = f"https://api.telegram.org/bot{TELE_TOKEN}/sendMessage"
         cac_dong = van_ban.split("\n")
@@ -246,9 +238,7 @@ def gui_hoac_sua_menu(chat_id, van_ban, nut_bam=None, msg_id=None, giu_co_dinh=F
             HTTP.post(url, json=payload, timeout=10)
         return
 
-    # 2. Dọn sạch các tin nhắn phụ (nếu có từ lần xem trước)
     don_dep_tin_nhan_phu(chat_id)
-
     target_mid = msg_id or DASHBOARD_MSG_ID.get(key_cid)
 
     cac_dong = van_ban.split("\n")
@@ -264,7 +254,6 @@ def gui_hoac_sua_menu(chat_id, van_ban, nut_bam=None, msg_id=None, giu_co_dinh=F
     if not cac_phan:
         cac_phan = [van_ban]
 
-    # Trường hợp 1 khung duy nhất (nhanh và gọn nhất)
     if len(cac_phan) == 1:
         if target_mid:
             payload = {"chat_id": chat_id, "message_id": target_mid, "text": cac_phan[0]}
@@ -281,12 +270,10 @@ def gui_hoac_sua_menu(chat_id, van_ban, nut_bam=None, msg_id=None, giu_co_dinh=F
                     return
             except Exception:
                 pass
-            # Nếu khung cũ đã bị người dùng xóa lịch sử -> Reset và bật lại bàn phím cố định
             xoa_tin_nhan_an_toan(chat_id, target_mid)
             DASHBOARD_MSG_ID.pop(key_cid, None)
             gui_ban_phim_co_dinh(chat_id)
         elif key_cid not in ANCHOR_KEYBOARD_ID:
-            # Nếu chưa có bàn phím cố định -> Bật bàn phím cố định trước
             gui_ban_phim_co_dinh(chat_id)
 
         payload = {"chat_id": chat_id, "text": cac_phan[0]}
@@ -303,7 +290,6 @@ def gui_hoac_sua_menu(chat_id, van_ban, nut_bam=None, msg_id=None, giu_co_dinh=F
             pass
         return
 
-    # Trường hợp nội dung rất dài (> 3800 ký tự)
     for idx, p in enumerate(cac_phan):
         la_phan_cuoi = (idx == len(cac_phan) - 1)
         if idx == 0 and target_mid:
@@ -346,8 +332,122 @@ def gui_hoac_sua_menu(chat_id, van_ban, nut_bam=None, msg_id=None, giu_co_dinh=F
 
 
 # ==============================================================================
-# 2. ĐỒNG BỘ GOOGLE SHEET SIÊU TỐC (QUÉT ĐA LUỒNG SONG SONG 4 TK)
+# 2. ĐỒNG BỘ GOOGLE SHEET & LỆNH NẠP TIỀN CỤM TỪ TELEGRAM
 # ==============================================================================
+def phan_tich_lenh_nap_tien(text_raw):
+    """
+    Hỗ trợ gõ tự nhiên:
+    - nap H 2tr        -> Cụm H, ngày hôm nay, +2.000.000đ
+    - nap TRUST 28/10 3tr -> Cụm TRUST, ngày 28/10, +3.000.000đ
+    - nap H =2tr       -> Ghi đè cứng cột Nạp tiền Cụm H hôm nay thành 2.000.000đ
+    - nap H -500k      -> Trừ 500.000đ
+    """
+    s = text_raw.strip()
+    m_cmd = re.match(r"^(?:/nap|/naptien|nap|nạp|nạp tiền|nap tien)\s+(.+)$", s, flags=re.IGNORECASE)
+    if not m_cmd:
+        return None
+
+    phan_con_lai = m_cmd.group(1).strip()
+    tokens = phan_con_lai.split()
+    if not tokens:
+        return {"error": "⚠️ Cú pháp: `nap [Tên Cụm] [Số tiền]`\nVí dụ: `nap H 2tr` hoặc `nap TRUST 28/10 3tr`"}
+
+    now_vn = lay_gio_viet_nam()
+    ngay_ymd = now_vn.strftime("%Y-%m-%d")
+    cluster = None
+    amount = None
+    mode = "add"
+
+    for tk in tokens:
+        # Kiểm tra xem có phải ngày (VD: 28/10 hoặc 28/10/2026) không
+        m_date = re.match(r"^(\d{1,2})[\/\-](\d{1,2})(?:[\/\-](\d{2,4}))?$", tk)
+        if m_date and amount is None:
+            d1, m1, y1 = m_date.groups()
+            y1 = int(y1) if y1 else now_vn.year
+            if y1 < 100:
+                y1 += 2000
+            try:
+                dt = datetime(y1, int(m1), int(d1))
+                ngay_ymd = dt.strftime("%Y-%m-%d")
+                continue
+            except ValueError:
+                pass
+
+        # Kiểm tra xem có phải số tiền (VD: 2tr, 2.5m, 500k, =2tr, -1tr, 2000000) không
+        tk_clean = tk.lower().replace(",", ".")
+        m_amt = re.match(r"^([\=\+\-]?)(\d+(?:\.\d+)?)(tr|trieu|triệu|m|củ|cu|k|nghin|nghìn|đ|d)?$", tk_clean)
+        if m_amt and (m_amt.group(3) or len(m_amt.group(2).replace(".", "")) >= 4 or tk_clean.startswith("=")):
+            prefix, num_str, unit = m_amt.groups()
+            if prefix == "=":
+                mode = "set"
+            sign = -1 if prefix == "-" else 1
+            if unit in ["tr", "trieu", "triệu", "m", "củ", "cu"]:
+                val = int(float(num_str) * 1000000)
+            elif unit in ["k", "nghin", "nghìn"]:
+                val = int(float(num_str) * 1000)
+            else:
+                val = int(float(num_str.replace(".", "")))
+            amount = sign * val
+            continue
+
+        # Nếu không phải ngày hay tiền -> Là tên Cụm
+        if cluster is None:
+            cluster = tk.upper()
+            if cluster in ["TRUS", "TRUST"]:
+                cluster = "TRUST"
+
+    if not cluster or cluster.lower() in ["tổng", "tong"]:
+        return {
+            "error": (
+                "⚠️ Bạn vui lòng ghi rõ **Tên Cụm** cần nạp nhé (Tab Tổng sẽ tự động cộng từ các Cụm)!\n\n"
+                "👉 Ví dụ đúng:\n"
+                "• `nap H 2tr` (Nạp 2 triệu vào Cụm H hôm nay)\n"
+                "• `nap TRUST 28/10 3tr` (Nạp 3 triệu vào Cụm TRUST ngày 28/10)\n"
+                "• `nap H =2tr` (Sửa lại số tiền nạp Cụm H hôm nay thành 2 triệu)"
+            )
+        }
+
+    if amount is None:
+        return {"error": f"⚠️ Chưa rõ số tiền cần nạp cho Cụm [{cluster}].\nVí dụ: `nap {cluster} 2tr`"}
+
+    return {
+        "action": "deposit",
+        "cluster": cluster,
+        "ngay": ngay_ymd,
+        "amount": amount,
+        "mode": mode,
+    }
+
+
+def day_lenh_nap_tien_len_sheet(lenh_nap):
+    if not SHEET_WEBHOOK_URL:
+        return False, "⚠️ Chưa có SHEET_WEBHOOK_URL trong GitHub Secrets."
+    try:
+        r = HTTP.post(SHEET_WEBHOOK_URL, json=lenh_nap, timeout=30, allow_redirects=True).json()
+        if r.get("status") == "success":
+            che_do_txt = "Ghi đè thành" if r.get("mode") == "set" else "Cộng thêm"
+            dau = "+" if r.get("amount", 0) >= 0 and r.get("mode") != "set" else ""
+            msg = (
+                f"✅ ĐÃ GHI NHẬN NẠP TIỀN VÀO SHEET!\n"
+                f"━━━━━━━━━━━━━━━━━━━━\n"
+                f"📦 Cụm nạp: [{r.get('cluster')}] • Ngày: {r.get('ngay_str')}\n"
+                f"💵 Thao tác ({che_do_txt}): {dau}{int(r.get('amount', 0)):,} ₫\n"
+                f"📝 Ô Nạp tiền ngày {r.get('ngay_str')} ({r.get('cluster')}): {int(r.get('so_moi', 0)):,} ₫\n"
+                f"━━━━━━━━━━━━━━━━━━━━\n"
+                f"📊 THỐNG KÊ RIÊNG CỤM [{r.get('cluster')}]:\n"
+                f"• Tổng nạp tháng: {int(r.get('cum_tong_nap', 0)):,} ₫\n"
+                f"• Ngân sách còn lại: {int(r.get('cum_con_lai', 0)):,} ₫\n"
+                f"━━━━━━━━━━━━━━━━━━━━\n"
+                f"🏦 TAB TỔNG (TỰ CỘNG TỪ CÁC CỤM):\n"
+                f"• Tổng nạp toàn BM: {int(r.get('tong_all_nap', 0)):,} ₫\n"
+                f"💰 Tổng ngân sách còn lại: {int(r.get('tong_all_con_lai', 0)):,} ₫"
+            )
+            return True, msg
+        return False, f"⚠️ {r.get('message', 'Lỗi không xác định từ Google Sheet')}"
+    except Exception as e:
+        return False, f"⚠️ Lỗi kết nối Google Sheet: {e}"
+
+
 def xac_dinh_khoang_ngay_tu_preset(che_do):
     now_vn = lay_gio_viet_nam()
     hom_nay = now_vn.strftime("%Y-%m-%d")
@@ -1130,6 +1230,7 @@ def hien_luong_1_ds_tai_khoan(cid, msg_id=None, tg_mac_dinh="today"):
         f"💳 DANH SÁCH TÀI KHOẢN QUẢNG CÁO\n"
         f"🕒 {lay_gio_viet_nam().strftime('%H:%M - %d/%m/%Y')} | 🧾 VAT: {THUE_VAT_FB}%\n"
         f"━━━━━━━━━━━━━━━━━━━━\n{ds}\n━━━━━━━━━━━━━━━━━━━━\n"
+        f"💡 Mẹo: Gõ `nap [Cụm] [Số tiền]` (VD: `nap H 2tr`) để điền Nạp tiền vào Sheet!\n"
         f"👇 Chạm vào Tài khoản để xem số liệu & AI bắt bệnh:"
     )
     gui_hoac_sua_menu(cid, van_ban, nut, msg_id)
@@ -1170,6 +1271,9 @@ def hien_luong_4_cong_no_va_cai_dat(cid, msg_id=None):
     ]
     for idx, acc in enumerate(BO_NHO_BM.values(), 1):
         lines.append(f"{idx}. {acc['icon']} {acc['ten']}: Nợ {acc['balance']:,}đ | Tổng tiêu: {acc['amount_spent']:,}đ")
+
+    lines.append("━━━━━━━━━━━━━━━━━━━━")
+    lines.append("💡 Cú pháp nạp tiền Cụm: `nap H 2tr` hoặc `nap TRUST 28/10 3tr`")
 
     nut = [
         [{"text": "📥 Điền Cả Tháng Này Vào Sheet (1 -> Nay)", "callback_data": "SYNC_SHEET|this_month"}],
@@ -1380,7 +1484,7 @@ def chay_vong_lap_truc_chien_247(offset_ban_dau=0):
     global AI_UU_TIEN, KY_TUY_CHINH
     offset = offset_ban_dau
     thoi_diem_bat_dau = time.time()
-    print("🟢 Bot đang trực chiến 24/7 (Bản Phục Hồi Tự Động & Giữ Bàn Phím Cố Định)...")
+    print("🟢 Bot đang trực chiến 24/7 (Hỗ trợ Nạp tiền Cụm & Tự cộng sang Tab Tổng)...")
 
     while time.time() - thoi_diem_bat_dau < THOI_GIAN_DUY_TRI_PHIEN:
         try:
@@ -1393,7 +1497,6 @@ def chay_vong_lap_truc_chien_247(offset_ban_dau=0):
             for update in res.get("result", []):
                 offset = update["update_id"] + 1
 
-                # XỬ LÝ TIN NHẮN VĂN BẢN / NÚT BẤM DƯỚI ĐÁY MÀN HÌNH
                 if "message" in update and "text" in update["message"]:
                     msg_obj = update["message"]
                     cid = msg_obj["chat"]["id"]
@@ -1404,21 +1507,40 @@ def chay_vong_lap_truc_chien_247(offset_ban_dau=0):
                     text_raw = msg_obj["text"].strip()
                     text_in = text_raw.lower()
 
-                    # Xóa tin nhắn lệnh vừa gõ để không làm trôi khung chat
                     xoa_tin_nhan_an_toan(cid, user_msg_id)
-
                     active_mid = DASHBOARD_MSG_ID.get(str(cid))
 
-                    # Nếu người dùng gõ /start hoặc /menu -> Luôn làm mới lại thanh bàn phím 4 nút dưới đáy
                     if text_in in ["/start", "/menu", "menu"]:
                         gui_ban_phim_co_dinh(cid)
 
+                    # 1. KIỂM TRA LỆNH NẠP TIỀN CHO CỤM (VD: nap H 2tr)
+                    lenh_nap = phan_tich_lenh_nap_tien(text_raw)
+                    if lenh_nap:
+                        nut_back_nap = [
+                            [{"text": "💰 Về Rà Soát Ngân Sách", "callback_data": "MENU_AUDIT"}],
+                            [{"text": "💳 Về DS Tài Khoản", "callback_data": "MENU_ACCOUNTS"}],
+                        ]
+                        if "error" in lenh_nap:
+                            gui_hoac_sua_menu(cid, lenh_nap["error"], nut_back_nap, active_mid)
+                        else:
+                            gui_hoac_sua_menu(
+                                cid,
+                                f"⏳ Đang nạp {lenh_nap['amount']:,}đ vào Cụm [{lenh_nap['cluster']}] và cộng sang Tab Tổng...",
+                                None,
+                                active_mid,
+                            )
+                            _, msg_kq_nap = day_lenh_nap_tien_len_sheet(lenh_nap)
+                            gui_hoac_sua_menu(cid, msg_kq_nap, nut_back_nap, DASHBOARD_MSG_ID.get(str(cid)))
+                        continue
+
+                    # 2. KIỂM TRA NGÀY TÙY CHỈNH
                     kq_ngay = phan_tich_ngay_tuy_chinh(text_raw)
                     if kq_ngay:
                         KY_TUY_CHINH = kq_ngay
                         hien_menu_chon_luong_cho_ngay_tuy_chinh(cid, active_mid)
                         continue
 
+                    # 3. CÁC LUỒNG MENU CHÍNH
                     if text_in in ["/start", "/menu", "menu", "💳 danh sách tài khoản"]:
                         hien_luong_1_ds_tai_khoan(cid, active_mid)
                     elif text_in in ["/baocao", "📊 báo cáo tổng (4 tk)"]:
@@ -1440,11 +1562,9 @@ def chay_vong_lap_truc_chien_247(offset_ban_dau=0):
                         TRANG_THAI_LICH[cid] = {"start": None}
                         hien_bang_lich(cid, active_mid, target="CUSTOM_HUB")
                     else:
-                        # Khi gõ bất kỳ chữ gì sau khi xóa lịch sử trò chuyện -> Bật lại bàn phím + Bảng điều khiển ngay
                         gui_ban_phim_co_dinh(cid)
                         hien_luong_1_ds_tai_khoan(cid, active_mid)
 
-                # XỬ LÝ TẤT CẢ CÁC NÚT BẤM INLINE TRÊN BẢNG ĐIỀU KHIỂN
                 elif "callback_query" in update:
                     cb = update["callback_query"]
                     cid = cb["message"]["chat"]["id"]
