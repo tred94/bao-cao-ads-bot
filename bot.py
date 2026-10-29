@@ -74,8 +74,9 @@ def cai_dat_menu_lenh_telegram():
     url = f"https://api.telegram.org/bot{TELE_TOKEN}/setMyCommands"
     commands = [
         {"command": "menu", "description": "💳 Mở Danh sách Tài khoản & Bật bàn phím"},
-        {"command": "baocao", "description": "📊 Mở Báo cáo Tổng (4 TK)"},
+        {"command": "sodu", "description": "💰 Kiểm tra Số dư Ngân sách từng Cụm trên Sheet"},
         {"command": "rasoat", "description": "💰 Mở Rà soát Ngân sách"},
+        {"command": "baocao", "description": "📊 Mở Báo cáo Tổng (4 TK)"},
         {"command": "sheet", "description": "📥 Điền Cả Tháng (1 -> Nay) vào Google Sheet"},
         {"command": "congno", "description": "🏦 Kiểm tra Công nợ & Cài đặt AI"},
         {"command": "lich", "description": "📅 Mở Bảng Lịch chọn ngày"},
@@ -120,9 +121,6 @@ def tach_ten_cum(ten_camp):
     else:
         words = s.split()
         prefix = words[0].upper() if words else "KHAC"
-
-    if prefix in ["TRUS", "TRUST"]:
-        return "TRUST"
     return prefix[:15]
 
 
@@ -332,16 +330,147 @@ def gui_hoac_sua_menu(chat_id, van_ban, nut_bam=None, msg_id=None, giu_co_dinh=F
 
 
 # ==============================================================================
-# 2. ĐỒNG BỘ GOOGLE SHEET & LỆNH NẠP TIỀN CỤM TỪ TELEGRAM
+# 2. ĐỒNG BỘ SHEET, LỆNH NẠP TIỀN & KIỂM TRA SỐ DƯ TỪNG CỤM (T & H)
 # ==============================================================================
+def phan_tich_lenh_kiem_tra_so_du(text_raw):
+    """
+    Nhận diện lệnh kiểm tra tiền từng Cụm:
+    - /sodu, sodu, so du, kt tien, tiền cụm -> Xem tất cả các Cụm tháng hiện tại
+    - sodu H, sodu T                       -> Xem chi tiết Cụm H / Cụm T
+    - sodu 9/2026                          -> Xem số dư các Cụm tháng 9/2026
+    """
+    s = text_raw.strip()
+    m = re.match(
+        r"^(?:/sodu|/tiencum|sodu|so du|số dư|tiền cụm|tien cum|kt tien|kiểm tra tiền)(?:\s+(.+))?$",
+        s,
+        flags=re.IGNORECASE,
+    )
+    if not m:
+        return None
+
+    now_vn = lay_gio_viet_nam()
+    month, year = now_vn.month, now_vn.year
+    cluster = ""
+
+    arg_str = (m.group(1) or "").strip()
+    if arg_str:
+        for tk in arg_str.split():
+            m_my = re.match(r"^t?(\d{1,2})[\/\-](\d{2,4})$", tk, flags=re.IGNORECASE)
+            if m_my:
+                month = int(m_my.group(1))
+                year = int(m_my.group(2))
+                if year < 100:
+                    year += 2000
+            else:
+                cluster = tk.upper()
+
+    return {"action": "check_balance", "month": month, "year": year, "cluster": cluster}
+
+
+def xem_so_du_cac_cum_tren_sheet(month=None, year=None, cluster=""):
+    if not SHEET_WEBHOOK_URL:
+        return "⚠️ Chưa có SHEET_WEBHOOK_URL trong GitHub Secrets.", []
+
+    now_vn = lay_gio_viet_nam()
+    if not month or not year:
+        month, year = now_vn.month, now_vn.year
+
+    payload = {"action": "check_balance", "month": month, "year": year, "cluster": cluster}
+    try:
+        r = HTTP.post(SHEET_WEBHOOK_URL, json=payload, timeout=30, allow_redirects=True).json()
+        if r.get("status") != "success":
+            return f"⚠️ Lỗi từ Google Sheet: {r.get('message', 'Không rõ')}", []
+
+        ds_cum = r.get("clusters", [])
+        tk_tong = r.get("total_tab")
+
+        tieu_de = (
+            f"💰 CHI TIẾT NGÂN SÁCH CỤM [{cluster.upper()}] (THÁNG {month:02d}/{year})"
+            if cluster
+            else f"📊 THỐNG KÊ NGÂN SÁCH TỪNG CỤM (THÁNG {month:02d}/{year})"
+        )
+        lines = [tieu_de, "━━━━━━━━━━━━━━━━━━━━"]
+
+        nut_cum = []
+        hang_nut = []
+
+        if not ds_cum:
+            lines.append("ℹ️ Chưa tìm thấy dữ liệu Cụm nào trong tháng này.")
+        else:
+            ds_cum.sort(key=lambda x: x.get("tongChi", 0), reverse=True)
+            for idx, c in enumerate(ds_cum, 1):
+                ten_c = c.get("name", "Khác")
+                nap = int(c.get("tongNap", 0))
+                chay = int(c.get("nganSachChay", 0))
+                thue = int(c.get("thue", 0))
+                chi = int(c.get("tongChi", 0))
+                con_lai = int(c.get("conLai", 0))
+                mess = int(c.get("tongMess", 0))
+                ls_nap = c.get("lichSuNap", [])
+
+                if con_lai < 0:
+                    icon_st = "🔴"
+                    canh_bao = " (ÂM NGÂN SÁCH!)"
+                elif con_lai <= 500000 and chi > 0:
+                    icon_st = "🟡"
+                    canh_bao = " (Sắp hết tiền!)"
+                else:
+                    icon_st = "🟢"
+                    canh_bao = ""
+
+                lines.append(
+                    f"{idx}. {icon_st} CỤM [{ten_c}] ({mess} mess):\n"
+                    f"   • Tổng nạp: {nap:,} ₫\n"
+                    f"   • Đã chạy: {chay:,} ₫ + Thuế: {thue:,} ₫ ➔ Tổng chi: {chi:,} ₫\n"
+                    f"   • 💰 Còn lại: {con_lai:,} ₫{canh_bao}"
+                )
+                if cluster and ls_nap:
+                    lines.append(f"   • 📅 Lịch sử nạp: {', '.join(ls_nap)}")
+                elif ls_nap and len(ls_nap) <= 4:
+                    lines.append(f"   • 📅 Đã nạp: {', '.join(ls_nap)}")
+
+                if not cluster:
+                    hang_nut.append({"text": f"🔍 Soi Cụm {ten_c}", "callback_data": f"SODU_CUM|{ten_c}|{month}|{year}"})
+                    if len(hang_nut) == 2:
+                        nut_cum.append(hang_nut)
+                        hang_nut = []
+
+        if hang_nut:
+            nut_cum.append(hang_nut)
+
+        if tk_tong and not cluster:
+            t_nap = int(tk_tong.get("tongNap", 0))
+            t_chay = int(tk_tong.get("nganSachChay", 0))
+            t_thue = int(tk_tong.get("thue", 0))
+            t_chi = int(tk_tong.get("tongChi", 0))
+            t_con = int(tk_tong.get("conLai", 0))
+            lines.append("━━━━━━━━━━━━━━━━━━━━")
+            lines.append(
+                f"🏦 TỔNG TOÀN BM (TAB TỔNG):\n"
+                f"• Tổng nạp các Cụm: {t_nap:,} ₫\n"
+                f"• Ngân sách chạy: {t_chay:,} ₫ + Thuế 10%: {t_thue:,} ₫\n"
+                f"• Tổng chi phí: {t_chi:,} ₫\n"
+                f"💰 TỔNG CÒN LẠI: {t_con:,} ₫"
+            )
+
+        lines.append("━━━━━━━━━━━━━━━━━━━━")
+        lines.append("💡 Gõ `nap H 2tr` hoặc `nap T 3tr` để nạp thêm tiền.")
+
+        if cluster:
+            nut_cum.append([{"text": "📊 Xem Tất Cả Các Cụm", "callback_data": f"CHECK_BALANCE|{month}|{year}"}])
+        else:
+            nut_cum.append([{"text": "🔄 Làm mới Số dư Sheet", "callback_data": f"CHECK_BALANCE|{month}|{year}"}])
+
+        nut_cum.append([
+            {"text": "💰 Về Rà Soát Ngân Sách", "callback_data": "MENU_AUDIT"},
+            {"text": "💳 Về DS Tài Khoản", "callback_data": "MENU_ACCOUNTS"},
+        ])
+        return "\n".join(lines), nut_cum
+    except Exception as e:
+        return f"⚠️ Lỗi kết nối Google Sheet: {e}", [[{"text": "⬅️ Quay lại", "callback_data": "MENU_AUDIT"}]]
+
+
 def phan_tich_lenh_nap_tien(text_raw):
-    """
-    Hỗ trợ gõ tự nhiên:
-    - nap H 2tr        -> Cụm H, ngày hôm nay, +2.000.000đ
-    - nap TRUST 28/10 3tr -> Cụm TRUST, ngày 28/10, +3.000.000đ
-    - nap H =2tr       -> Ghi đè cứng cột Nạp tiền Cụm H hôm nay thành 2.000.000đ
-    - nap H -500k      -> Trừ 500.000đ
-    """
     s = text_raw.strip()
     m_cmd = re.match(r"^(?:/nap|/naptien|nap|nạp|nạp tiền|nap tien)\s+(.+)$", s, flags=re.IGNORECASE)
     if not m_cmd:
@@ -350,7 +479,7 @@ def phan_tich_lenh_nap_tien(text_raw):
     phan_con_lai = m_cmd.group(1).strip()
     tokens = phan_con_lai.split()
     if not tokens:
-        return {"error": "⚠️ Cú pháp: `nap [Tên Cụm] [Số tiền]`\nVí dụ: `nap H 2tr` hoặc `nap TRUST 28/10 3tr`"}
+        return {"error": "⚠️ Cú pháp: `nap [Tên Cụm] [Số tiền]`\nVí dụ: `nap H 2tr` hoặc `nap T 28/10 3tr`"}
 
     now_vn = lay_gio_viet_nam()
     ngay_ymd = now_vn.strftime("%Y-%m-%d")
@@ -359,7 +488,6 @@ def phan_tich_lenh_nap_tien(text_raw):
     mode = "add"
 
     for tk in tokens:
-        # Kiểm tra xem có phải ngày (VD: 28/10 hoặc 28/10/2026) không
         m_date = re.match(r"^(\d{1,2})[\/\-](\d{1,2})(?:[\/\-](\d{2,4}))?$", tk)
         if m_date and amount is None:
             d1, m1, y1 = m_date.groups()
@@ -373,7 +501,6 @@ def phan_tich_lenh_nap_tien(text_raw):
             except ValueError:
                 pass
 
-        # Kiểm tra xem có phải số tiền (VD: 2tr, 2.5m, 500k, =2tr, -1tr, 2000000) không
         tk_clean = tk.lower().replace(",", ".")
         m_amt = re.match(r"^([\=\+\-]?)(\d+(?:\.\d+)?)(tr|trieu|triệu|m|củ|cu|k|nghin|nghìn|đ|d)?$", tk_clean)
         if m_amt and (m_amt.group(3) or len(m_amt.group(2).replace(".", "")) >= 4 or tk_clean.startswith("=")):
@@ -390,11 +517,8 @@ def phan_tich_lenh_nap_tien(text_raw):
             amount = sign * val
             continue
 
-        # Nếu không phải ngày hay tiền -> Là tên Cụm
         if cluster is None:
             cluster = tk.upper()
-            if cluster in ["TRUS", "TRUST"]:
-                cluster = "TRUST"
 
     if not cluster or cluster.lower() in ["tổng", "tong"]:
         return {
@@ -402,7 +526,7 @@ def phan_tich_lenh_nap_tien(text_raw):
                 "⚠️ Bạn vui lòng ghi rõ **Tên Cụm** cần nạp nhé (Tab Tổng sẽ tự động cộng từ các Cụm)!\n\n"
                 "👉 Ví dụ đúng:\n"
                 "• `nap H 2tr` (Nạp 2 triệu vào Cụm H hôm nay)\n"
-                "• `nap TRUST 28/10 3tr` (Nạp 3 triệu vào Cụm TRUST ngày 28/10)\n"
+                "• `nap T 28/10 3tr` (Nạp 3 triệu vào Cụm T ngày 28/10)\n"
                 "• `nap H =2tr` (Sửa lại số tiền nạp Cụm H hôm nay thành 2 triệu)"
             )
         }
@@ -1022,9 +1146,7 @@ def rà_soat_chi_tieu_bm(che_do="this_month", since_date=None, until_date=None, 
         ])
     nut_xem_nhom.append([
         {"text": f"📊 Đẩy Kỳ Này Lên Sheet ({nhan_hien_thi})", "callback_data": f"SYNC_SHEET|{che_do}"},
-    ])
-    nut_xem_nhom.append([
-        {"text": "📥 Điền Cả Tháng Vào Sheet (1 -> Nay)", "callback_data": "SYNC_SHEET|this_month"},
+        {"text": "💰 Số Dư Các Cụm (Sheet)", "callback_data": "CHECK_BALANCE"},
     ])
     nut_xem_nhom.append([
         {"text": "📅 Mở Bảng Lịch", "callback_data": "CAL_OPEN|AUDIT"},
@@ -1225,12 +1347,13 @@ def hien_luong_1_ds_tai_khoan(cid, msg_id=None, tg_mac_dinh="today"):
             hang = []
     if hang:
         nut.append(hang)
+    nut.append([{"text": "💰 Kiểm Tra Số Dư Từng Cụm (Sheet)", "callback_data": "CHECK_BALANCE"}])
     ds = "\n".join([f"  {idx}. {tk['icon']} {tk['ten']}" for idx, tk in enumerate(BO_NHO_BM.values(), 1)])
     van_ban = (
         f"💳 DANH SÁCH TÀI KHOẢN QUẢNG CÁO\n"
         f"🕒 {lay_gio_viet_nam().strftime('%H:%M - %d/%m/%Y')} | 🧾 VAT: {THUE_VAT_FB}%\n"
         f"━━━━━━━━━━━━━━━━━━━━\n{ds}\n━━━━━━━━━━━━━━━━━━━━\n"
-        f"💡 Mẹo: Gõ `nap [Cụm] [Số tiền]` (VD: `nap H 2tr`) để điền Nạp tiền vào Sheet!\n"
+        f"💡 Nạp tiền: `nap H 2tr`, `nap T 3tr` | Xem tiền Cụm: `sodu`, `sodu H`, `sodu T`\n"
         f"👇 Chạm vào Tài khoản để xem số liệu & AI bắt bệnh:"
     )
     gui_hoac_sua_menu(cid, van_ban, nut, msg_id)
@@ -1243,7 +1366,10 @@ def hien_luong_2_bao_cao_tong(cid, msg_id=None):
         "Chọn khung thời gian để xuất báo cáo thực chiến và tự động đồng bộ vào Google Sheet:"
     )
     nut = tao_khung_thoi_gian_chuan("QuickReport", None, "REPORT")
-    nut.append([{"text": "📥 Điền Cả Tháng Này Vào Sheet (1 -> Nay)", "callback_data": "SYNC_SHEET|this_month"}])
+    nut.append([
+        {"text": "📥 Điền Cả Tháng Vào Sheet", "callback_data": "SYNC_SHEET|this_month"},
+        {"text": "💰 Số Dư Các Cụm", "callback_data": "CHECK_BALANCE"},
+    ])
     gui_hoac_sua_menu(cid, van_ban, nut, msg_id)
 
 
@@ -1254,7 +1380,10 @@ def hien_luong_3_ra_soat_ngan_sach(cid, msg_id=None):
         f"Chọn khung thời gian hoặc mở Bảng Lịch để kiểm toán: Tổng chi phí = Chi phí QC + Thuế VAT ({THUE_VAT_FB}%):"
     )
     nut = tao_khung_thoi_gian_chuan("AUDIT", None, "AUDIT")
-    nut.append([{"text": "📥 Điền Cả Tháng Này Vào Sheet (1 -> Nay)", "callback_data": "SYNC_SHEET|this_month"}])
+    nut.append([
+        {"text": "📥 Điền Cả Tháng Vào Sheet", "callback_data": "SYNC_SHEET|this_month"},
+        {"text": "💰 Số Dư Các Cụm (Sheet)", "callback_data": "CHECK_BALANCE"},
+    ])
     gui_hoac_sua_menu(cid, van_ban, nut, msg_id)
 
 
@@ -1273,9 +1402,10 @@ def hien_luong_4_cong_no_va_cai_dat(cid, msg_id=None):
         lines.append(f"{idx}. {acc['icon']} {acc['ten']}: Nợ {acc['balance']:,}đ | Tổng tiêu: {acc['amount_spent']:,}đ")
 
     lines.append("━━━━━━━━━━━━━━━━━━━━")
-    lines.append("💡 Cú pháp nạp tiền Cụm: `nap H 2tr` hoặc `nap TRUST 28/10 3tr`")
+    lines.append("💡 Nạp tiền Cụm: `nap H 2tr`, `nap T 3tr` | Kiểm tra tiền Cụm: `sodu`, `sodu H`, `sodu T`")
 
     nut = [
+        [{"text": "💰 Kiểm Tra Số Dư Từng Cụm (Sheet)", "callback_data": "CHECK_BALANCE"}],
         [{"text": "📥 Điền Cả Tháng Này Vào Sheet (1 -> Nay)", "callback_data": "SYNC_SHEET|this_month"}],
         [
             {"text": "📊 Đẩy Hôm Qua Lên Sheet", "callback_data": "SYNC_SHEET|yesterday"},
@@ -1484,7 +1614,7 @@ def chay_vong_lap_truc_chien_247(offset_ban_dau=0):
     global AI_UU_TIEN, KY_TUY_CHINH
     offset = offset_ban_dau
     thoi_diem_bat_dau = time.time()
-    print("🟢 Bot đang trực chiến 24/7 (Hỗ trợ Nạp tiền Cụm & Tự cộng sang Tab Tổng)...")
+    print("🟢 Bot đang trực chiến 24/7 (Chuẩn Cụm T & H)...")
 
     while time.time() - thoi_diem_bat_dau < THOI_GIAN_DUY_TRI_PHIEN:
         try:
@@ -1513,12 +1643,22 @@ def chay_vong_lap_truc_chien_247(offset_ban_dau=0):
                     if text_in in ["/start", "/menu", "menu"]:
                         gui_ban_phim_co_dinh(cid)
 
-                    # 1. KIỂM TRA LỆNH NẠP TIỀN CHO CỤM (VD: nap H 2tr)
+                    # 1. KIỂM TRA LỆNH XEM SỐ DƯ TỪNG CỤM (VD: /sodu, sodu, sodu H, sodu T)
+                    lenh_sodu = phan_tich_lenh_kiem_tra_so_du(text_raw)
+                    if lenh_sodu:
+                        gui_hoac_sua_menu(cid, "⏳ Đang đọc bảng Thống Kê Ngân Sách từng Cụm từ Google Sheet...", None, active_mid)
+                        van_ban_sd, nut_sd = xem_so_du_cac_cum_tren_sheet(
+                            lenh_sodu["month"], lenh_sodu["year"], lenh_sodu["cluster"]
+                        )
+                        gui_hoac_sua_menu(cid, van_ban_sd, nut_sd, DASHBOARD_MSG_ID.get(str(cid)))
+                        continue
+
+                    # 2. KIỂM TRA LỆNH NẠP TIỀN CHO CỤM (VD: nap H 2tr, nap T 3tr)
                     lenh_nap = phan_tich_lenh_nap_tien(text_raw)
                     if lenh_nap:
                         nut_back_nap = [
+                            [{"text": "💰 Xem Số Dư Tất Cả Các Cụm", "callback_data": "CHECK_BALANCE"}],
                             [{"text": "💰 Về Rà Soát Ngân Sách", "callback_data": "MENU_AUDIT"}],
-                            [{"text": "💳 Về DS Tài Khoản", "callback_data": "MENU_ACCOUNTS"}],
                         ]
                         if "error" in lenh_nap:
                             gui_hoac_sua_menu(cid, lenh_nap["error"], nut_back_nap, active_mid)
@@ -1533,14 +1673,14 @@ def chay_vong_lap_truc_chien_247(offset_ban_dau=0):
                             gui_hoac_sua_menu(cid, msg_kq_nap, nut_back_nap, DASHBOARD_MSG_ID.get(str(cid)))
                         continue
 
-                    # 2. KIỂM TRA NGÀY TÙY CHỈNH
+                    # 3. KIỂM TRA NGÀY TÙY CHỈNH
                     kq_ngay = phan_tich_ngay_tuy_chinh(text_raw)
                     if kq_ngay:
                         KY_TUY_CHINH = kq_ngay
                         hien_menu_chon_luong_cho_ngay_tuy_chinh(cid, active_mid)
                         continue
 
-                    # 3. CÁC LUỒNG MENU CHÍNH
+                    # 4. CÁC LUỒNG MENU CHÍNH
                     if text_in in ["/start", "/menu", "menu", "💳 danh sách tài khoản"]:
                         hien_luong_1_ds_tai_khoan(cid, active_mid)
                     elif text_in in ["/baocao", "📊 báo cáo tổng (4 tk)"]:
@@ -1554,8 +1694,8 @@ def chay_vong_lap_truc_chien_247(offset_ban_dau=0):
                         gui_hoac_sua_menu(cid, f"⏳ Đang đồng bộ đa luồng ({s_d} ➔ {u_d}) vào Google Sheet...", None, active_mid)
                         _, msg_sh = dong_bo_khoang_ngay_len_sheet(s_d, u_d)
                         nut_sh = [
+                            [{"text": "💰 Xem Số Dư Các Cụm", "callback_data": "CHECK_BALANCE"}],
                             [{"text": "💰 Về Rà Soát Ngân Sách", "callback_data": "MENU_AUDIT"}],
-                            [{"text": "💳 Về DS Tài Khoản", "callback_data": "MENU_ACCOUNTS"}],
                         ]
                         gui_hoac_sua_menu(cid, msg_sh, nut_sh, DASHBOARD_MSG_ID.get(str(cid)))
                     elif text_in in ["/lich"]:
@@ -1587,6 +1727,20 @@ def chay_vong_lap_truc_chien_247(offset_ban_dau=0):
 
                     if lenh == "CAL_IGNORE":
                         continue
+                    elif lenh == "CHECK_BALANCE":
+                        now_vn = lay_gio_viet_nam()
+                        m_b = int(parts[1]) if len(parts) > 1 else now_vn.month
+                        y_b = int(parts[2]) if len(parts) > 2 else now_vn.year
+                        gui_hoac_sua_menu(cid, f"⏳ Đang đọc Số dư Ngân sách các Cụm (Tháng {m_b:02d}/{y_b})...", None, msg_id)
+                        van_ban_sd, nut_sd = xem_so_du_cac_cum_tren_sheet(m_b, y_b)
+                        gui_hoac_sua_menu(cid, van_ban_sd, nut_sd, msg_id)
+
+                    elif lenh == "SODU_CUM":
+                        ten_c, m_b, y_b = parts[1], int(parts[2]), int(parts[3])
+                        gui_hoac_sua_menu(cid, f"⏳ Đang đọc chi tiết Cụm [{ten_c}]...", None, msg_id)
+                        van_ban_sd, nut_sd = xem_so_du_cac_cum_tren_sheet(m_b, y_b, cluster=ten_c)
+                        gui_hoac_sua_menu(cid, van_ban_sd, nut_sd, msg_id)
+
                     elif lenh == "SET_AI":
                         AI_UU_TIEN = parts[1]
                         hien_luong_4_cong_no_va_cai_dat(cid, msg_id)
@@ -1712,8 +1866,8 @@ def chay_vong_lap_truc_chien_247(offset_ban_dau=0):
                         gui_hoac_sua_menu(cid, f"⏳ Đang đồng bộ đa luồng ({s_d} ➔ {u_d}) vào Google Sheet...", None, msg_id)
                         _, msg_sh = dong_bo_khoang_ngay_len_sheet(s_d, u_d)
                         nut_sh = [
+                            [{"text": "💰 Xem Số Dư Các Cụm", "callback_data": "CHECK_BALANCE"}],
                             [{"text": "💰 Về Rà Soát Ngân Sách", "callback_data": "MENU_AUDIT"}],
-                            [{"text": "💳 Về DS Tài Khoản", "callback_data": "MENU_ACCOUNTS"}],
                         ]
                         gui_hoac_sua_menu(cid, msg_sh, nut_sh, msg_id)
 
